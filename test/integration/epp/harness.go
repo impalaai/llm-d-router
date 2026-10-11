@@ -136,6 +136,7 @@ func WithTracing() HarnessOption {
 // metricsBackend abstracts how pod metrics are injected into the test environment.
 type metricsBackend interface {
 	SetPodMetrics(m map[types.NamespacedName]*fwkdl.Metrics)
+	SetPodPollErrors(errs map[types.NamespacedName]error)
 }
 
 // mockDataSourceBackend wraps the mock DataSource to implement metricsBackend.
@@ -145,6 +146,10 @@ type mockDataSourceBackend struct {
 
 func (b *mockDataSourceBackend) SetPodMetrics(m map[types.NamespacedName]*fwkdl.Metrics) {
 	b.mockDataSource.SetMetrics(m)
+}
+
+func (b *mockDataSourceBackend) SetPodPollErrors(errs map[types.NamespacedName]error) {
+	b.mockDataSource.SetErrors(errs)
 }
 
 // TestHarness encapsulates the environment for a single isolated EPP test run.
@@ -380,6 +385,12 @@ func (h *TestHarness) WithPods(pods []PodState) *TestHarness {
 		require.NoError(h.t, k8sClient.Status().Update(h.ctx, pod), "failed to update status for pod %s", name)
 	}
 	return h
+}
+
+// SetPodPollErrors makes every metrics poll of the given endpoints fail with the
+// mapped error. A nil map makes every poll succeed.
+func (h *TestHarness) SetPodPollErrors(errs map[types.NamespacedName]error) {
+	h.metricsBackend.SetPodPollErrors(errs)
 }
 
 // WaitForReadyPodsMetric blocks until the prometheus metric 'inference_pool_ready_pods' matches the expected count.
