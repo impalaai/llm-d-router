@@ -181,5 +181,7 @@ func (r *pollStatusRecorder) record(ep fwkdl.Endpoint, err error, now time.Time)
 		}
 		r.status.ConsecutiveFailures++
 	}
-	ep.GetAttributes().Put(r.key, &r.status)
+	// Readers hold the stored value, so store a copy the next record cannot modify.
+	status := r.status
+	ep.GetAttributes().Put(r.key, &status)
 }
