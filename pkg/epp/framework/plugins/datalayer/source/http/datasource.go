@@ -88,6 +88,12 @@ func NewHTTPDataSource[T any](scheme, path string, skipCertVerification bool,
 
 func (s *HTTPDataSource[T]) TypedName() fwkplugin.TypedName { return s.typedName }
 
+// Produces declares the PollStatus the datalayer collector records for this
+// source, so consumers of it are validated against the configured sources.
+func (s *HTTPDataSource[T]) Produces() map[fwkplugin.DataKey]any {
+	return map[fwkplugin.DataKey]any{fwkdl.PollStatusDataKey(s.typedName.Name): &fwkdl.PollStatus{}}
+}
+
 // Poll fetches and parses one tick. Exposed for tests; runtime uses Dispatch.
 func (s *HTTPDataSource[T]) Poll(ctx context.Context, ep fwkdl.Endpoint) (T, error) {
 	target := s.getEndpoint(ep.GetMetadata())

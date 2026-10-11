@@ -289,3 +289,10 @@ func (o *orderedStub) Extract(ctx context.Context, in fwkdl.PollInput[int]) erro
 	o.mu.Unlock()
 	return o.stub.Extract(ctx, in)
 }
+
+func TestProducesPollStatus(t *testing.T) {
+	parser := func(r io.Reader) (int, error) { return 0, nil }
+	s, err := NewHTTPDataSource("http", "/metrics", false, "test-type", "vllm-metrics", parser)
+	require.NoError(t, err)
+	assert.Equal(t, map[fwkplugin.DataKey]any{fwkdl.PollStatusDataKey("vllm-metrics"): &fwkdl.PollStatus{}}, s.Produces())
+}
