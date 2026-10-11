@@ -68,3 +68,42 @@ Three metrics covering ext_proc gRPC stream lifecycle. Disabled by default; enab
 *   **Release Stage:** ALPHA
 *   **Description:** Total ext_proc gRPC streams completed, by gRPC status code.
 *   **Usage:** Rate of `code="OK"` is the healthy stream-completion rate. A rising rate of `code="Internal"` or `code="Unknown"` indicates handler errors. `code="Canceled"` is expected on Envoy restarts and rolling EPP updates.
+
+## Endpoint Health Metrics
+
+Metrics of the `endpoint-health-filter` plugin, registered when the filter is configured and emitted under the `llm_d_epp_` prefix. The `reason` label is `poll` for failing metric polls and `response` for consecutive failed responses.
+
+### `endpoint_health_excluded_endpoints`
+
+*   **Type:** Gauge
+*   **Labels:**
+    *   `plugin_name`: string — the configured filter instance name.
+*   **Release Stage:** ALPHA
+*   **Description:** Endpoints the filter currently excludes from scheduling.
+
+### `endpoint_health_ejections_total`
+
+*   **Type:** Counter
+*   **Labels:**
+    *   `plugin_name`: string — the configured filter instance name.
+    *   `reason`: string — `poll` or `response`.
+*   **Release Stage:** ALPHA
+*   **Description:** Endpoints marked unhealthy.
+
+### `endpoint_health_readmissions_total`
+
+*   **Type:** Counter
+*   **Labels:**
+    *   `plugin_name`: string — the configured filter instance name.
+    *   `reason`: string — `poll` or `response`.
+*   **Release Stage:** ALPHA
+*   **Description:** Unhealthy marks cleared. An endpoint is readmitted once no reason marks it.
+
+### `endpoint_health_fail_open_total`
+
+*   **Type:** Counter
+*   **Labels:**
+    *   `plugin_name`: string — the configured filter instance name.
+*   **Release Stage:** ALPHA
+*   **Description:** Scheduling cycles in which every candidate was unhealthy and all were kept.
+*   **Usage:** Alert on a non-zero rate: every endpoint the filter sees is failing.
