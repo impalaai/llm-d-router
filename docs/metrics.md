@@ -77,7 +77,7 @@ Metrics of the `endpoint-health-filter` plugin, registered when the filter is co
 
 *   **Type:** Gauge
 *   **Labels:**
-    *   `plugin_name`: string — the configured filter instance name.
+    *   `plugin_name`: string, the configured filter instance name.
 *   **Release Stage:** ALPHA
 *   **Description:** Endpoints the filter currently excludes from scheduling.
 
@@ -85,8 +85,8 @@ Metrics of the `endpoint-health-filter` plugin, registered when the filter is co
 
 *   **Type:** Counter
 *   **Labels:**
-    *   `plugin_name`: string — the configured filter instance name.
-    *   `reason`: string — `poll` or `response`.
+    *   `plugin_name`: string, the configured filter instance name.
+    *   `reason`: string, `poll` or `response`.
 *   **Release Stage:** ALPHA
 *   **Description:** Endpoints marked unhealthy.
 
@@ -94,8 +94,8 @@ Metrics of the `endpoint-health-filter` plugin, registered when the filter is co
 
 *   **Type:** Counter
 *   **Labels:**
-    *   `plugin_name`: string — the configured filter instance name.
-    *   `reason`: string — `poll` or `response`.
+    *   `plugin_name`: string, the configured filter instance name.
+    *   `reason`: string, `poll` or `response`.
 *   **Release Stage:** ALPHA
 *   **Description:** Unhealthy marks cleared. An endpoint is readmitted once no reason marks it.
 
@@ -103,7 +103,7 @@ Metrics of the `endpoint-health-filter` plugin, registered when the filter is co
 
 *   **Type:** Counter
 *   **Labels:**
-    *   `plugin_name`: string — the configured filter instance name.
+    *   `plugin_name`: string, the configured filter instance name.
 *   **Release Stage:** ALPHA
 *   **Description:** Scheduling cycles in which every candidate was unhealthy and all were kept.
 *   **Usage:** Alert on a non-zero rate: every endpoint the filter sees is failing.
