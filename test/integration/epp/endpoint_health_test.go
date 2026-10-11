@@ -30,7 +30,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	eppRunner "github.com/llm-d/llm-d-router/cmd/epp/runner"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	dlmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/mocks"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	"github.com/llm-d/llm-d-router/test/integration"
 )
@@ -289,4 +292,16 @@ func TestEndpointHealth_FailsOpenWhenEveryEndpointFails(t *testing.T) {
 		routed[routeAndRespond(t, h, respondOK)] = true
 	}
 	assert.Greater(t, len(routed), 1, "requests are spread over the unhealthy endpoints")
+}
+
+// TestEndpointHealth_UnknownPollSourceFailsStartup rejects a pollSource that
+// names no configured polling data source instead of running without poll
+// health.
+func TestEndpointHealth_UnknownPollSourceFailsStartup(t *testing.T) {
+	opts := defaultEppServerOptions(t, "unused", endpointHealthConfig(`
+      pollSource: no-such-source`))
+	source := dlmocks.NewDataSource(fwkplugin.TypedName{Type: mockDataSourceType, Name: mockDataSourceType})
+
+	_, _, _, err := eppRunner.NewTestRunnerSetup(t.Context(), testEnv.Config, opts, source)
+	require.ErrorContains(t, err, "poll-status/no-such-source")
 }
