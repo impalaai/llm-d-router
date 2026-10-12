@@ -468,7 +468,9 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			for _, header := range v.ResponseHeaders.Headers.GetHeaders() {
 				value := string(header.RawValue)
 				loggerTrace.Info("header", "key", header.Key, "value", value)
-				if header.Key == "status" && value != "200" {
+				// Envoy sends the response status as the ":status" pseudo-header
+				// (backport of upstream #3330).
+				if (header.Key == ":status" || header.Key == "status") && value != "200" {
 					reqCtx.ResponseStatusCode = errcommon.ModelServerError
 				} else if header.Key == "content-type" && strings.Contains(value, "text/event-stream") {
 					reqCtx.modelServerStreaming = true
