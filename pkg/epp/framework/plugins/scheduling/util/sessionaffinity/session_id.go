@@ -375,3 +375,76 @@ func (s *SessionIDHeader) runEviction(ctx context.Context, interval time.Duratio
 		}
 	}
 }
+
+// --- impala fork: read-only binding lookup -----------------------------------
+//
+// BindingLookup is the read-only view of the session_id binding store that the
+// impala-admission-filter consumes (impala-gateway spec
+// 2026-10-12-llmd-gradual-endpoint-lifecycle-design section 5.2). It never
+// mutates bindings: PreRequest stays the only writer. Endpoint identifiers are
+// EndpointMetadata.ID.String() ("namespace/name"), the same key PreRequest
+// stores.
+type BindingLookup interface {
+	// ResolveSessionID returns the request's session identifier from the
+	// configured sources, or "" when the request carries none.
+	ResolveSessionID(ctx context.Context, request *scheduling.InferenceRequest) string
+	// BoundEndpoint returns the endpoint the session is bound to. ok is false
+	// when the session is unbound or its binding has outlived the TTL (the
+	// sweeper may not have run yet; expiry is checked here against now).
+	BoundEndpoint(sessionID string, now time.Time) (string, bool)
+	// BindingCounts returns, per bound endpoint, the number of unexpired
+	// bindings (Total) and the subset refreshed within recentWindow (Recent).
+	BindingCounts(recentWindow time.Duration, now time.Time) map[string]BindingCounts
+}
+
+// BindingCounts is one endpoint's row of BindingLookup.BindingCounts.
+type BindingCounts struct {
+	Total  int
+	Recent int
+}
+
+var _ BindingLookup = (*SessionIDHeader)(nil)
+
+// ResolveSessionID exports resolveSessionID for read-only consumers.
+func (s *SessionIDHeader) ResolveSessionID(ctx context.Context, request *scheduling.InferenceRequest) string {
+	return s.resolveSessionID(ctx, request)
+}
+
+// BoundEndpoint implements BindingLookup. Unlike boundPod it treats an
+// expired-but-unswept binding as absent, so a consumer never pins to a
+// binding the sweeper is about to drop.
+func (s *SessionIDHeader) BoundEndpoint(sessionID string, now time.Time) (string, bool) {
+	if sessionID == "" {
+		return "", false
+	}
+	value, ok := s.bindings.Load(sessionID)
+	if !ok {
+		return "", false
+	}
+	b, ok := value.(binding)
+	if !ok || s.expired(b.lastSeen, now) {
+		return "", false
+	}
+	return b.podName, true
+}
+
+// BindingCounts implements BindingLookup. It is a sync.Map Range snapshot:
+// no lock is taken, concurrent PreRequest calls are tolerated and the result
+// is best-effort by one request, which is all a load measure needs.
+func (s *SessionIDHeader) BindingCounts(recentWindow time.Duration, now time.Time) map[string]BindingCounts {
+	counts := map[string]BindingCounts{}
+	s.bindings.Range(func(_, value any) bool {
+		b, ok := value.(binding)
+		if !ok || s.expired(b.lastSeen, now) {
+			return true
+		}
+		c := counts[b.podName]
+		c.Total++
+		if now.Sub(b.lastSeen) <= recentWindow {
+			c.Recent++
+		}
+		counts[b.podName] = c
+		return true
+	})
+	return counts
+}
