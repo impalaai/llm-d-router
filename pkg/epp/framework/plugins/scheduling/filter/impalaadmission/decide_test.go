@@ -228,9 +228,11 @@ func TestDecide_WarmingTakesAPlaceableRequestWithProbabilityShare(t *testing.T) 
 }
 
 func TestDecide_WarmingNeverTakesAConversationThatHasAHome(t *testing.T) {
-	out, _ := (&run{cands: []candidate{warming("w", 1, 0), c("a", 14*blk), c("b", 4*blk)}, u: 0}).do(t)
+	r := &run{cands: []candidate{warming("w", 1, 0), c("a", 14*blk), c("b", 4*blk)}, u: 0}
+	out, _ := r.do(t)
 	assert.Equal(t, []string{"w", "a", "b"}, out)
-	r := &run{cands: []candidate{warming("w", 1, 0), c("a", 4*blk), c("b", 4*blk)}, bound: "default/a", u: 0}
+	assert.Equal(t, 0, r.rngUsed, "a request that is not placeable never draws")
+	r = &run{cands: []candidate{warming("w", 1, 0), c("a", 4*blk), c("b", 4*blk)}, bound: "default/a", u: 0}
 	out, _ = r.do(t)
 	assert.Equal(t, []string{"w", "a", "b"}, out)
 	assert.Equal(t, 0, r.rngUsed, "a bound request never draws")
@@ -245,6 +247,25 @@ func TestDecide_WarmingOverloadStop(t *testing.T) {
 	cands[0].load = 4.9
 	out, _ = (&run{cands: cands}).do(t)
 	assert.Equal(t, []string{"w"}, out)
+}
+
+func TestDecide_AnOverloadedDrawStopsWithoutTryingTheNextWarmingEndpoint(t *testing.T) {
+	// u = 0.1 lands on w1 (acc 0.25), which is overloaded (10 >= 0 + 1). The stop must
+	// end the draw: continuing to w2 (acc 0.5, idle) would force w2.
+	cands := []candidate{withLoad(warming("w1", 0.5, 0), 10), warming("w2", 0.5, 0), c("a", 0)}
+	out, decs := (&run{cands: cands, u: 0.1}).do(t)
+	assert.Equal(t, []string{"w1", "w2", "a"}, out)
+	assert.Empty(t, decs)
+}
+
+func TestDecide_TheOverloadMeanIsOverTheKeptCandidates(t *testing.T) {
+	// d (load 10) is steered off the list first, so the settled mean is a's 4 alone and
+	// w (5 >= 4 + 1) is overloaded. A mean over all non-warming candidates, (4+10)/2 = 7,
+	// would force w.
+	cands := []candidate{withLoad(warming("w", 1, 0), 5), withLoad(c("a", 0), 4), withLoad(draining("d", PhaseRetain, 0), 10)}
+	out, decs := (&run{cands: cands}).do(t)
+	assert.Equal(t, []string{"w", "a"}, out)
+	assert.Equal(t, []decision{dec("d", StateDraining, PhaseRetain, decisionSteered, 0)}, decs)
 }
 
 func TestDecide_WarmingOnAnIdlePoolIsForced(t *testing.T) {
