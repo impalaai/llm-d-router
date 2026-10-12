@@ -605,6 +605,99 @@ func TestRefresh_ARefreshPanicIsRecovered(t *testing.T) {
 	p.bindings = &fakeLookup{panicCounts: true}
 	before := testutil.ToFloat64(panicsTotal)
 	handle := testHandle(t)
-	assert.NotPanics(t, func() { p.refreshOnce(handle.Context(), handle) })
+	assert.NotPanics(t, func() { p.refreshOnce(handle.Context(), handle, ids("a")) })
 	assert.Equal(t, before+1, testutil.ToFloat64(panicsTotal))
+}
+
+// listedPods is a pod source the test can change while a refresh loop reads it;
+// it counts the reads.
+type listedPods struct {
+	mu    sync.Mutex
+	pods  []k8stypes.NamespacedName
+	reads int
+}
+
+func (l *listedPods) list() []k8stypes.NamespacedName {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reads++
+	return l.pods
+}
+
+func (l *listedPods) set(pods []k8stypes.NamespacedName) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.pods = pods
+}
+
+func (l *listedPods) readCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.reads
+}
+
+// runRefreshLoop runs p.refreshLoop over source until the test ends, then
+// cancels it and waits for it to return.
+func runRefreshLoop(t *testing.T, p *Plugin, source *listedPods, startupInterval, interval time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(utils.NewTestContext(t))
+	handle := fwkplugin.NewEppHandle(ctx, source.list)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.refreshLoop(ctx, handle, startupInterval, interval)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
+func TestRefreshLoop_PublishesAtStartWithoutWaitingAnInterval(t *testing.T) { // fix round 1
+	p, _ := newTestPlugin(t, `{"sessionAffinityPluginName":"sa"}`, true)
+	p.bindings = &fakeLookup{counts: map[string]sessionutil.BindingCounts{"default/w": {Total: 2, Recent: 1}}}
+	source := &listedPods{pods: ids("w", "a")}
+	// Both intervals are an hour, so only the immediate refresh can publish.
+	runRefreshLoop(t, p, source, time.Hour, time.Hour)
+	require.Eventually(t, func() bool {
+		return testutil.CollectAndCount(endpointLoad) == 2 && testutil.CollectAndCount(sessionBindings) == 2 &&
+			testutil.CollectAndCount(sessionBindingsRecent) == 2
+	}, 5*time.Second, 5*time.Millisecond, "the loop's first refresh must run at start")
+	assert.Equal(t, 1.0, gauge(t, endpointLoad, "w"))
+	assert.Equal(t, 2.0, gauge(t, sessionBindings, "w"))
+	assert.Equal(t, 0.0, gauge(t, endpointLoad, "a"))
+}
+
+func TestRefreshLoop_PublishesAsSoonAsThePoolIsListed(t *testing.T) { // fix round 1
+	p, _ := newTestPlugin(t, "", false) // prefix plane; the handle has no in-flight producer
+	endpointLoad.WithLabelValues("sentinel").Set(5)
+	source := &listedPods{}
+	runRefreshLoop(t, p, source, 5*time.Millisecond, time.Hour)
+
+	// While the datastore lists nothing the loop keeps checking and touches no gauge.
+	require.Eventually(t, func() bool { return source.readCount() >= 3 }, 5*time.Second, time.Millisecond)
+	assert.Equal(t, 5.0, gauge(t, endpointLoad, "sentinel"))
+
+	// Discovery lists the pool: the next check refreshes, long before the hour-long
+	// interval. The producer is not resolvable, so the load series are published at 0.
+	source.set(ids("a", "b"))
+	require.Eventually(t, func() bool {
+		return testutil.CollectAndCount(endpointLoad) == 2
+	}, 5*time.Second, 5*time.Millisecond, "the loop must refresh once the pool is listed")
+	assert.Equal(t, 0.0, gauge(t, endpointLoad, "a"))
+	assert.Equal(t, 0.0, gauge(t, endpointLoad, "b"))
+}
+
+func TestRefreshOnce_RetriesTheProducerLookupUntilItResolves(t *testing.T) { // fix round 1
+	p, _ := newTestPlugin(t, "", false)
+	handle := testHandle(t)
+	p.refreshOnce(handle.Context(), handle, ids("a"))
+	assert.Nil(t, p.inFlight, "no producer yet: refresh still publishes")
+	assert.Equal(t, 1, testutil.CollectAndCount(endpointLoad))
+
+	plg, err := inflightload.InFlightLoadProducerFactory(inflightload.InFlightLoadProducerType, nil, handle)
+	require.NoError(t, err)
+	handle.AddPlugin(inflightload.InFlightLoadProducerType, plg)
+	p.refreshOnce(handle.Context(), handle, ids("a"))
+	assert.NotNil(t, p.inFlight, "a later refresh resolves the producer")
 }

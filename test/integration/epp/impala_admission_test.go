@@ -205,9 +205,20 @@ func routeSession(t *testing.T, h *TestHarness, sessionID, status string) string
 // package-level and outlive a harness, so counter assertions use deltas.
 func impalaMetric(t *testing.T, name string, labels map[string]string) float64 {
 	t.Helper()
+	total := 0.0
+	for _, v := range impalaSeries(t, name, labels) {
+		total += v
+	}
+	return total
+}
+
+// impalaSeries returns the value of every series of family `name` whose labels
+// include `labels`, so a caller can tell an absent series from a zero one.
+func impalaSeries(t *testing.T, name string, labels map[string]string) []float64 {
+	t.Helper()
 	families, err := crmetrics.Registry.Gather()
 	require.NoError(t, err)
-	total := 0.0
+	var values []float64
 	for _, family := range families {
 		if family.GetName() != name {
 			continue
@@ -224,13 +235,13 @@ func impalaMetric(t *testing.T, name string, labels map[string]string) float64 {
 				}
 			}
 			if m.GetCounter() != nil {
-				total += m.GetCounter().GetValue()
+				values = append(values, m.GetCounter().GetValue())
 			} else {
-				total += m.GetGauge().GetValue()
+				values = append(values, m.GetGauge().GetValue())
 			}
 		}
 	}
-	return total
+	return values
 }
 
 // approxIndexBlocks reads the auto-created approx-prefix-cache-producer's
@@ -297,7 +308,7 @@ func TestImpalaAdmission_RetainKeepsBoundSessionsAndSteersNewOnes(t *testing.T) 
 	routeSession(t, h, "s-bound", "502")
 	assert.Equal(t, 2.0, impalaMetric(t, "impala_endpoint_errors_total", errorsLabels)-errorsBefore)
 
-	// The 15 s refresh publishes the drained endpoint's bindings and load. s-bound
+	// The periodic refresh publishes the drained endpoint's bindings and load. s-bound
 	// is the only session bound there (new sessions are steered away), so both are
 	// exactly 1; the series also being absent for a pod that left the pool is
 	// covered by the plugin's unit tests.
@@ -328,8 +339,18 @@ func TestImpalaAdmission_WarmingTakesNewSessions(t *testing.T) {
 	forced := map[string]string{"endpoint": warmingName, "decision": "forced"}
 	forcedBefore := impalaMetric(t, "impala_admission_decisions_total", forced)
 
-	// Until the first 15 s refresh the plugin's recent-binding cache is empty, so
+	// The plugin refreshes as soon as the datastore lists the pool (about 1 s at
+	// most, not the 15 s interval), publishing a zero load series for every
+	// endpoint, so an EPP restart never leaves the series absent. Waiting for that
+	// refresh also keeps it out of the burst below. A stale series from an earlier
+	// harness cannot stand in: the retain test leaves a load of 1 behind. Until the
+	// next refresh, 15 s later, the recent-binding cache stays empty, so
 	// load(W) = 0 < mean+1 and every placeable request is forced onto W.
+	require.Eventually(t, func() bool {
+		loads := impalaSeries(t, "impala_admission_endpoint_load", nil)
+		return len(loads) == len(pods) && impalaMetric(t, "impala_admission_endpoint_load", nil) == 0 &&
+			len(impalaSeries(t, "impala_session_bindings", nil)) == len(pods)
+	}, 5*time.Second, 50*time.Millisecond, "the startup refresh never published a zero load series for every endpoint")
 	const forcedRequests = 6
 	for i := range forcedRequests {
 		assert.Equal(t, endpointAddr(2), routeSession(t, h, fmt.Sprintf("w-%d", i), "200"), "share=1 forces the placeable request onto the warming endpoint")

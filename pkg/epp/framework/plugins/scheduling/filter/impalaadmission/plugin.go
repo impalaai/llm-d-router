@@ -45,9 +45,14 @@ import (
 const PluginType = "impala-admission-filter"
 
 const (
-	refreshInterval    = 15 * time.Second
-	statusPseudoHeader = ":status"
-	statusHeader       = "status"
+	// refreshInterval is the steady-state cadence of the gauge refresh loop.
+	refreshInterval = 15 * time.Second
+	// startupRefreshInterval is how often the loop checks for the first listed
+	// endpoint, so the contract series appear about one second after the pool
+	// is known rather than one refreshInterval later.
+	startupRefreshInterval = time.Second
+	statusPseudoHeader     = ":status"
+	statusHeader           = "status"
 )
 
 var (
@@ -174,7 +179,11 @@ func Factory(name string, raw *json.Decoder, handle fwkplugin.Handle) (fwkplugin
 	if err := registerMetrics(handle.Metrics()); err != nil {
 		return nil, err
 	}
-	go p.refreshLoop(handle)
+	ctx := handle.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go p.refreshLoop(ctx, handle, startupRefreshInterval, refreshInterval)
 	return p, nil
 }
 
@@ -422,28 +431,56 @@ func (p *Plugin) ResponseHeader(_ context.Context, _ *fwksched.InferenceRequest,
 	endpointErrorsTotal.WithLabelValues(target.ID.Name, strconv.Itoa(code)).Inc()
 }
 
-// refreshLoop republishes the per-endpoint gauges every refreshInterval until
-// the handle's context ends.
-func (p *Plugin) refreshLoop(handle fwkplugin.Handle) {
-	ctx := handle.Context()
-	if ctx == nil {
-		ctx = context.Background()
+// refreshLoop republishes the per-endpoint gauges until ctx ends. It refreshes
+// as soon as the datastore lists an endpoint, then every interval. The pool is
+// checked at once and then every startupInterval, because the factory runs
+// during config load and file discovery or the pod reconciler fill the
+// datastore only afterwards (runner.go @v0.10.0), so the list is normally
+// still empty at start. Without this, every EPP restart would leave the
+// contract series absent for one interval, which llmd-manager reads as "plugin
+// not running". Until that first refresh there is nothing to publish, so the
+// startup checks touch no gauge.
+func (p *Plugin) refreshLoop(ctx context.Context, handle fwkplugin.Handle, startupInterval, interval time.Duration) {
+	pods, ok := awaitPods(ctx, handle, startupInterval)
+	if !ok {
+		return
 	}
-	ticker := time.NewTicker(refreshInterval)
+	p.refreshOnce(ctx, handle, pods)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			p.refreshOnce(ctx, handle)
+			p.refreshOnce(ctx, handle, handle.PodList())
 		}
 	}
 }
 
-// refreshOnce runs one refresh; a panic is counted and the refresh skipped,
-// because a panic on this goroutine would otherwise end the EPP process.
-func (p *Plugin) refreshOnce(ctx context.Context, handle fwkplugin.Handle) {
+// awaitPods returns the first non-empty pod list, checking immediately and
+// then every interval; ok is false when ctx ends first.
+func awaitPods(ctx context.Context, handle fwkplugin.Handle, interval time.Duration) ([]k8stypes.NamespacedName, bool) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-timer.C:
+			if pods := handle.PodList(); len(pods) > 0 {
+				return pods, true
+			}
+			timer.Reset(interval)
+		}
+	}
+}
+
+// refreshOnce runs one refresh over pods; a panic is counted and the refresh
+// skipped, because a panic on this goroutine would otherwise end the EPP
+// process. Prefix planes retry the producer lookup on every refresh until it
+// resolves.
+func (p *Plugin) refreshOnce(ctx context.Context, handle fwkplugin.Handle, pods []k8stypes.NamespacedName) {
 	defer func() {
 		if r := recover(); r != nil {
 			panicsTotal.Inc()
@@ -453,13 +490,16 @@ func (p *Plugin) refreshOnce(ctx context.Context, handle fwkplugin.Handle) {
 	if p.bindings == nil && p.inFlight == nil {
 		p.resolveInFlight(handle)
 	}
-	p.refresh(handle.PodList())
+	p.refresh(pods)
 }
 
 // resolveInFlight finds the default in-flight-load producer, which
 // CreateMissingDataProducers creates AFTER this plugin's factory ran
-// (runner.go @v0.10.0), named by its type. Reads the handle's plugin map,
-// which is only written during config load, long before the first tick.
+// (runner.go @v0.10.0), named by its type. It reads the handle's plugin map,
+// which has no lock and is written only during config load. The refresh loop
+// calls it only after the datastore has listed an endpoint. Discovery starts
+// only after config load, so the datastore's synchronisation orders this read
+// after every write to the map.
 func (p *Plugin) resolveInFlight(handle fwkplugin.Handle) {
 	if producer, ok := handle.Plugin(inflightload.InFlightLoadProducerType).(*inflightload.InFlightLoadProducer); ok && producer != nil {
 		p.inFlight = producer.GetRequests
