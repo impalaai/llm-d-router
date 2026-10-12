@@ -21,7 +21,7 @@ import "math"
 // candidate is one scheduling candidate as decide sees it.
 type candidate struct {
 	id    string    // EndpointMetadata.ID.String(); matches BindingLookup keys
-	name  string    // EndpointMetadata.Name; the metrics `endpoint` label
+	name  string    // EndpointMetadata.ID.Name; the metrics `endpoint` label (ruling P3)
 	lc    lifecycle // parsed labels (active on error)
 	match float64   // matched prefix TOKENS in this replica's approximate index
 	load  float64   // warming load measure (recent bindings or in-flight requests)
