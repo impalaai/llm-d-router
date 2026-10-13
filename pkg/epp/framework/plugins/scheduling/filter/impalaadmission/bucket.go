@@ -61,3 +61,7 @@ func (b *tokenBucket) take(cost float64, now time.Time) bool {
 
 // level is the token count after the last take; negative while in debt.
 func (b *tokenBucket) level() float64 { return b.tokens }
+
+// refund returns cost to the bucket, capped at its capacity: the inverse of a
+// successful take whose move did not happen.
+func (b *tokenBucket) refund(cost float64) { b.tokens = min(b.capacity, b.tokens+cost) }

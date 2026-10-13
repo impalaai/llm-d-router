@@ -445,8 +445,8 @@ then every 15 s for every endpoint in the pool. `endpoint` is the endpoint's fil
 *   **Type:** Counter
 *   **Labels:** none
 *   **Release Stage:** ALPHA
-*   **Description:** Endpoints seen with malformed or unknown `impala.ai/*` labels (treated as active).
-*   **Usage:** Any increase means a label writer produced a value the filter rejects.
+*   **Description:** Malformed or unknown `impala.ai/*` label sets seen, counted per candidate evaluation (a persistent bad label counts once per candidate per request; treated as active).
+*   **Usage:** Any increase means a label writer produced a value the filter rejects. The counter carries no endpoint label; the offending endpoint is named once at Info in the EPP log (`malformed lifecycle label`).
 
 #### `impala_admission_panics_total`
 

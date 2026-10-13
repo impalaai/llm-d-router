@@ -51,6 +51,9 @@ type decideInput struct {
 	minAdvantage float64
 	random       func() float64 // called at most once, only for a placeable request with a warming candidate
 	take         func(c candidate, cost float64) bool
+	// refund gives back a take when the never-empty restore below undoes the
+	// move it paid for. May be nil (nothing to refund).
+	refund func(c candidate, cost float64)
 }
 
 func newDecision(c candidate, kind string, moved float64) decision {
@@ -60,7 +63,11 @@ func newDecision(c candidate, kind string, moved float64) decision {
 // decide ports sim.admission_filter (scripts/llmd-router/lifecycle-sim/sim.py in
 // impala-gateway) minus the rejected warm_exclusive variant. It is pure apart
 // from in.random and in.take. It returns indices into in.cands in input order
-// and never an empty list when in.cands is non-empty.
+// and never an empty list when in.cands is non-empty. When every candidate
+// would be removed (the draining endpoint is the sole candidate, or the health
+// gate left only draining ones) the request lands on them anyway, so decide
+// refunds the takes it made and returns no decisions: nothing was moved or
+// steered, and spec §5.6 records nothing for a request that left no endpoint.
 func decide(in decideInput) ([]int, []decision) {
 	cands := in.cands
 	out := make([]int, 0, len(cands))
@@ -68,6 +75,11 @@ func decide(in decideInput) ([]int, []decision) {
 		out = append(out, i)
 	}
 	var decisions []decision
+	type paid struct {
+		c    candidate
+		cost float64
+	}
+	var takes []paid
 
 	// advantage(i) = match(i) - max(match(j) for j != i), over the ORIGINAL
 	// candidates: the tokens that would be re-prefilled if the request moved.
@@ -92,6 +104,11 @@ func decide(in decideInput) ([]int, []decision) {
 			belongs = in.boundID == d.id
 		}
 		cost := math.Max(adv, 0)
+		// After a sibling narrowing above, `out` is already a subset, so a later
+		// draining candidate can record `steered` for an endpoint that is no
+		// longer in `out` (remove is then a no-op). That is harmless double
+		// attribution: the request was kept off that endpoint twice over, and
+		// the decision still says which rule would have steered it.
 		switch {
 		case !belongs:
 			out = remove(out, i)
@@ -99,6 +116,7 @@ func decide(in decideInput) ([]int, []decision) {
 		case d.lc.Phase != PhaseMigrate:
 			decisions = append(decisions, newDecision(d, decisionRetained, 0))
 		case in.take(d, cost):
+			takes = append(takes, paid{d, cost})
 			out = remove(out, i)
 			decisions = append(decisions, newDecision(d, decisionMoved, cost))
 			// An empty box means "no box": nothing is a sibling of it (the sim
@@ -125,9 +143,18 @@ func decide(in decideInput) ([]int, []decision) {
 	}
 
 	if len(out) == 0 {
+		// Every candidate was steered or moved away, so none can be: restore
+		// them all, undo the bucket charges and drop the decisions, which would
+		// otherwise count moves (and moved tokens) that never happened.
+		if in.refund != nil {
+			for _, t := range takes {
+				in.refund(t.c, t.cost)
+			}
+		}
 		for i := range cands {
 			out = append(out, i)
 		}
+		return out, nil
 	}
 	return out, decisions
 }

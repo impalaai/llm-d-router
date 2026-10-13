@@ -409,8 +409,10 @@ func podLabels(extra map[string]string) map[string]string {
 // and blocks until the datastore's EndpointMetadata reflects them. Nothing
 // else about the pod changes, so this is the in-place metadata update path
 // (datastore.upsertEndpoint -> UpdateMetadata) a file-discovery label edit
-// takes in production.
-func (h *TestHarness) SetPodLabels(index int, extra map[string]string) {
+// takes in production. Every key in extra must be visible; settled, when
+// non-nil, is an additional predicate over the observed labels (e.g. "a label
+// I removed is gone") that must also hold.
+func (h *TestHarness) SetPodLabels(index int, extra map[string]string, settled func(observed map[string]string) bool) {
 	h.t.Helper()
 	name := fmt.Sprintf("pod-%d", index)
 	pod := &corev1.Pod{}
@@ -427,19 +429,10 @@ func (h *TestHarness) SetPodLabels(index int, extra map[string]string) {
 					return false
 				}
 			}
-			return len(extra) > 0 || !hasImpalaLabel(ep.GetMetadata().Labels)
+			return settled == nil || settled(ep.GetMetadata().Labels)
 		}
 		return false
 	}, 10*time.Second, 50*time.Millisecond, "datastore did not pick up the label change for %s", name)
-}
-
-func hasImpalaLabel(labels map[string]string) bool {
-	for k := range labels {
-		if strings.HasPrefix(k, "impala.ai/") {
-			return true
-		}
-	}
-	return false
 }
 
 // WaitForReadyPodsMetric blocks until the prometheus metric 'inference_pool_ready_pods' matches the expected count.

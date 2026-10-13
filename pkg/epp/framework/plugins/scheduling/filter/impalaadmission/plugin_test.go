@@ -24,11 +24,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -236,6 +238,8 @@ func TestFilter_NoLabelsIsIdentity(t *testing.T) {
 	p.random = func() float64 { t.Fatal("rng must not be drawn"); return 0 }
 	out := p.Filter(context.Background(), &fwksched.InferenceRequest{}, in)
 	assert.Equal(t, in, out)
+	require.Len(t, out, len(in))
+	assert.Same(t, &in[0], &out[0], "the input slice itself is returned, not a copy")
 	assert.Equal(t, 0, testutil.CollectAndCount(endpointLoad), "no lifecycle label: no per-decision series")
 }
 
@@ -297,6 +301,81 @@ func TestFilter_PrefixMatchInfoMissing(t *testing.T) {
 	assert.Equal(t, []string{"b"}, names(p.Filter(context.Background(), &fwksched.InferenceRequest{}, []fwksched.Endpoint{d, b})))
 }
 
+// capturedLogs returns a context whose logger records every line at V(0) or
+// below (Info and Error), as formatted text.
+func capturedLogs(t *testing.T) (context.Context, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var lines []string
+	sink := funcr.New(func(prefix, args string) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, prefix+" "+args)
+	}, funcr.Options{Verbosity: 0})
+	return log.IntoContext(context.Background(), sink), func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), lines...)
+	}
+}
+
+func TestFilter_MalformedLabelIsLoggedAtInfoOncePerEndpointAndError(t *testing.T) {
+	p, _ := newTestPlugin(t, "", false)
+	ctx, logs := capturedLogs(t)
+	a := testEndpoint("a", nil, 0)
+	bad := func(name, share string) fwksched.Endpoint {
+		return testEndpoint(name, map[string]string{LabelState: "warming", LabelShare: share}, 0)
+	}
+	filter := func(eps ...fwksched.Endpoint) { p.Filter(ctx, &fwksched.InferenceRequest{}, eps) }
+	count := func(sub string) int {
+		n := 0
+		for _, l := range logs() {
+			if strings.Contains(l, "malformed lifecycle label") && strings.Contains(l, sub) {
+				n++
+			}
+		}
+		return n
+	}
+
+	before := testutil.ToFloat64(labelErrorsTotal)
+	for range 3 {
+		filter(bad("x", "0.25 "), a)
+	}
+	require.Equal(t, 1, count(`"endpoint"="x"`), "first sight is logged once at Info, naming the endpoint, however many requests follow")
+	assert.Contains(t, strings.Join(logs(), "\n"), "impala.ai/share", "the line carries the error")
+	assert.Equal(t, before+3, testutil.ToFloat64(labelErrorsTotal), "the counter still counts every evaluation")
+
+	filter(bad("y", "0.25 "), a)
+	assert.Equal(t, 1, count(`"endpoint"="y"`), "another endpoint is its own key")
+
+	filter(bad("x", "2"), a)
+	assert.Equal(t, 2, count(`"endpoint"="x"`), "a different error on the same endpoint is logged again")
+	filter(bad("x", "2"), a)
+	assert.Equal(t, 2, count(`"endpoint"="x"`))
+
+	// Parsing cleanly again forgets the endpoint, so a relapse is logged again.
+	filter(testEndpoint("x", map[string]string{LabelState: "warming", LabelShare: "0.5"}, 0), a)
+	filter(bad("x", "2"), a)
+	assert.Equal(t, 3, count(`"endpoint"="x"`), "a relapse after a clean parse is logged again")
+}
+
+func TestRefresh_ForgetsLabelErrorsOfEndpointsThatLeftThePool(t *testing.T) {
+	p, _ := newTestPlugin(t, "", false)
+	ctx, logs := capturedLogs(t)
+	x := testEndpoint("x", map[string]string{LabelState: "warming", LabelShare: "?"}, 0)
+	filter := func() { p.Filter(ctx, &fwksched.InferenceRequest{}, []fwksched.Endpoint{x}) }
+	filter()
+	p.refresh(ids("other")) // x left the pool
+	filter()
+	n := 0
+	for _, l := range logs() {
+		if strings.Contains(l, "malformed lifecycle label") {
+			n++
+		}
+	}
+	assert.Equal(t, 2, n, "an endpoint that left and came back is logged afresh")
+}
+
 func TestFilter_MalformedLabelCountsAndIsActive(t *testing.T) {
 	p, _ := newTestPlugin(t, "", false)
 	before := testutil.ToFloat64(labelErrorsTotal)
@@ -304,6 +383,36 @@ func TestFilter_MalformedLabelCountsAndIsActive(t *testing.T) {
 	a := testEndpoint("a", nil, 0)
 	assert.Equal(t, []string{"x", "a"}, names(p.Filter(context.Background(), &fwksched.InferenceRequest{}, []fwksched.Endpoint{x, a})))
 	assert.Equal(t, before+1, testutil.ToFloat64(labelErrorsTotal))
+}
+
+func TestFilter_SoleDrainingEndpointRecordsNoMoveAndKeepsItsBucket(t *testing.T) {
+	// The never-empty restore leaves the request on the draining endpoint, so the
+	// metrics must not claim it moved, and the bucket must not be charged for it.
+	p, _ := newTestPlugin(t, `{"burstMinutes":1}`, false)
+	t0 := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return t0 }
+	migrate := func() fwksched.Endpoint {
+		return testEndpoint("d", map[string]string{LabelState: "draining", LabelPhase: "migrate", LabelBudgetTPM: "60000"}, 14)
+	}
+	req := &fwksched.InferenceRequest{}
+	// First sight creates the bucket empty; the move is deferred, which is a real decision.
+	assert.Equal(t, []string{"d"}, names(p.Filter(context.Background(), req, []fwksched.Endpoint{migrate()})))
+	assert.Equal(t, 1.0, counter(t, decisionsTotal, "d", "draining", "migrate", "deferred"))
+
+	resetMetrics()
+	p.now = func() time.Time { return t0.Add(time.Hour) } // the bucket is full: the take would succeed
+	assert.Equal(t, []string{"d"}, names(p.Filter(context.Background(), req, []fwksched.Endpoint{migrate()})))
+	assert.Equal(t, 0, testutil.CollectAndCount(decisionsTotal), "no moved decision for a request that stayed")
+	assert.Equal(t, 0, testutil.CollectAndCount(movedTokensTotal), "no moved tokens either")
+	assert.Equal(t, 60000.0, gauge(t, bucketTokens, "d"), "the bucket gauge shows the refund")
+	p.mu.Lock()
+	assert.Equal(t, 60000.0, p.buckets["default/d"].level(), "the bucket is back at its pre-take level")
+	p.mu.Unlock()
+
+	// A retain-phase sole endpoint is not "steered" either.
+	retain := testEndpoint("r", map[string]string{LabelState: "draining", LabelPhase: "retain"}, 0)
+	assert.Equal(t, []string{"r"}, names(p.Filter(context.Background(), req, []fwksched.Endpoint{retain})))
+	assert.Equal(t, 0, testutil.CollectAndCount(decisionsTotal))
 }
 
 func TestFilter_MetricsUseTheEndpointIDName(t *testing.T) { // ruling P3

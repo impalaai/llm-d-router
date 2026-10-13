@@ -50,6 +50,7 @@ type run struct {
 	bound   string
 	u       float64
 	take    func(candidate, float64) bool
+	refund  func(candidate, float64)
 	rngUsed int
 }
 
@@ -65,6 +66,7 @@ func (r *run) do(t *testing.T) ([]string, []decision) {
 		minAdvantage: blk,
 		random:       func() float64 { r.rngUsed++; return r.u },
 		take:         take,
+		refund:       r.refund,
 	})
 	require.NotEmpty(t, kept, "never empty")
 	names := make([]string, 0, len(kept))
@@ -215,6 +217,53 @@ func TestDecide_TwoDrainingEndpointsAfterASiblingNarrowingDoNotPanic(t *testing.
 	assert.Equal(t, []string{"s"}, out)
 }
 
+func TestDecide_SoleDrainingCandidateIsRestoredWithoutChargingTheBucket(t *testing.T) {
+	type refunded struct {
+		id   string
+		cost float64
+	}
+	tests := []struct {
+		name  string
+		cands []candidate
+		bound string
+		cost  float64 // expected take (and refund) per migrating endpoint
+	}{
+		{name: "retain, unbound, no advantage: steered then restored", cands: []candidate{draining("d", PhaseRetain, 0)}},
+		{name: "migrate, unbound: moved then restored", cands: []candidate{draining("d", PhaseMigrate, 14*blk)}, cost: 14 * blk},
+		{name: "migrate, bound to it: moved for free then restored", cands: []candidate{draining("d", PhaseMigrate, 4*blk)}, bound: "default/d"},
+		{
+			name:  "every candidate draining: all restored",
+			cands: []candidate{draining("d1", PhaseMigrate, 14*blk), draining("d2", PhaseRetain, 0)},
+			cost:  14 * blk,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var taken, gave []refunded
+			r := &run{
+				cands: tt.cands, bound: tt.bound,
+				take:   func(c candidate, cost float64) bool { taken = append(taken, refunded{c.id, cost}); return true },
+				refund: func(c candidate, cost float64) { gave = append(gave, refunded{c.id, cost}) },
+			}
+			out, decs := r.do(t)
+			assert.Len(t, out, len(tt.cands), "the never-empty restore returns every candidate")
+			assert.Empty(t, decs, "a request that lands on a draining endpoint it could not leave records no move or steer")
+			assert.Equal(t, taken, gave, "every take is refunded")
+		})
+	}
+
+	// A move that really leaves the endpoint is not refunded.
+	var gave int
+	r := &run{
+		cands: []candidate{draining("d", PhaseMigrate, 14*blk), c("a", 4*blk)}, take: takeAll,
+		refund: func(candidate, float64) { gave++ },
+	}
+	out, decs := r.do(t)
+	assert.Equal(t, []string{"a"}, out)
+	assert.Equal(t, []decision{dec("d", StateDraining, PhaseMigrate, decisionMoved, 10*blk)}, decs)
+	assert.Zero(t, gave)
+}
+
 // ---------------------------------------------------------------------- warming
 
 func TestDecide_WarmingTakesAPlaceableRequestWithProbabilityShare(t *testing.T) {
@@ -306,7 +355,7 @@ func TestDecide_NeverReturnsAnEmptyList(t *testing.T) {
 	r := &run{cands: []candidate{draining("d", PhaseRetain, 0)}}
 	out, decs := r.do(t)
 	assert.Equal(t, []string{"d"}, out)
-	assert.Equal(t, decisionSteered, decs[0].kind)
+	assert.Empty(t, decs, "the restore records no steer: the request stays on d")
 }
 
 func TestDecide_NoLabelsMeansPassThroughWithoutTouchingTheRNG(t *testing.T) {

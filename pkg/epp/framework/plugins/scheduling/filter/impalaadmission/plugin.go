@@ -141,6 +141,12 @@ type Plugin struct {
 
 	mu      sync.Mutex
 	buckets map[string]*tokenBucket // endpoint ID string -> migrate bucket
+
+	// labelErrLogged maps an endpoint ID string to the label error last logged
+	// for it, so a persistent bad label is logged at Info once, not per
+	// request. Entries are cleared when the endpoint parses cleanly or leaves
+	// the pool, so it holds at most one entry per currently malformed endpoint.
+	labelErrLogged sync.Map
 }
 
 // Factory builds the plugin, resolves the session-affinity instance (fails
@@ -227,6 +233,7 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 		minAdvantage: minAdvantage,
 		random:       p.random,
 		take:         p.take,
+		refund:       p.refund,
 	})
 	logger := log.FromContext(ctx).V(logutil.DEBUG)
 	for _, d := range decisions {
@@ -254,19 +261,12 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 // lifecycle state. On prefix planes it also reads each candidate's load; on
 // session planes observeLoads fills it from the cached bindings.
 func (p *Plugin) collect(ctx context.Context, endpoints []fwksched.Endpoint) ([]candidate, float64, bool) {
-	logger := log.FromContext(ctx).V(logutil.DEBUG)
 	cands := make([]candidate, len(endpoints))
 	blockSize, lifecycleSeen := 0, false
 	for i, ep := range endpoints {
 		md := ep.GetMetadata()
 		lc, err := parseLifecycle(md.Labels)
-		if err != nil {
-			// Debug level: this runs per request while a bad label persists; the
-			// counter is the alert.
-			labelErrorsTotal.Inc()
-			logger.Info("impala-admission-filter: malformed lifecycle label, treating the endpoint as active",
-				"endpoint", md.ID.Name, "error", err.Error())
-		}
+		p.noteLabelError(ctx, md, err)
 		if lc.State != StateActive {
 			lifecycleSeen = true
 		}
@@ -294,6 +294,30 @@ func (p *Plugin) collect(ctx context.Context, endpoints []fwksched.Endpoint) ([]
 		minAdvantage = 1
 	}
 	return cands, minAdvantage, lifecycleSeen
+}
+
+// noteLabelError counts a malformed-label candidate evaluation and names the
+// endpoint at Info the first time it (or a different error on it) is seen. The
+// counter has no endpoint label (the gateway's CATALOG expects it bare), so the
+// log line is the only way to find the offender; it is deduplicated because
+// this runs per candidate per request while a bad label persists. A clean parse
+// forgets the endpoint, so a relapse is reported again.
+func (p *Plugin) noteLabelError(ctx context.Context, md *fwkdl.EndpointMetadata, err error) {
+	key := md.ID.String()
+	if err == nil {
+		if _, seen := p.labelErrLogged.Load(key); seen {
+			p.labelErrLogged.Delete(key)
+		}
+		return
+	}
+	labelErrorsTotal.Inc()
+	msg := err.Error()
+	if prev, seen := p.labelErrLogged.Load(key); seen && prev == msg {
+		return
+	}
+	p.labelErrLogged.Store(key, msg)
+	log.FromContext(ctx).Info("impala-admission-filter: malformed lifecycle label, treating the endpoint as active",
+		"endpoint", md.ID.Name, "error", msg)
 }
 
 // loadOf is the prefix-plane load: the in-flight-load producer's request
@@ -388,11 +412,31 @@ func (p *Plugin) take(c candidate, cost float64) bool {
 	return ok
 }
 
+// refund undoes a take that decide's never-empty restore made moot: the request
+// stays on the draining endpoint, so it must not spend the migrate budget. The
+// level is capped at capacity (a full bucket may have gone negative on an
+// oversized move, and that debt is returned too). A bucket pruned in between
+// (the endpoint stopped migrating) has nothing to refund.
+func (p *Plugin) refund(c candidate, cost float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	b := p.buckets[c.id]
+	if b == nil || b.budgetTPM != c.lc.BudgetTPM {
+		return
+	}
+	b.refund(cost)
+	bucketTokens.WithLabelValues(c.name).Set(b.level())
+}
+
 // reconcileBuckets drops the bucket (and its gauge series) of every candidate
 // that is no longer in draining/migrate, so a later migrate starts empty and
 // a retracted migrate forgives any debt. Buckets of endpoints absent from the
 // candidates are left alone and pruned by the refresh loop once the endpoint
-// leaves the pool.
+// leaves the pool. Note that pruning on the refresh loop's view means one
+// inventory tick without the endpoint (a transient file-discovery gap) drops
+// its bucket: the debt is forgiven and, when the endpoint returns, the bucket
+// restarts EMPTY. That is the conservative direction, because a fresh bucket
+// can only move less than a surviving one.
 func (p *Plugin) reconcileBuckets(cands []candidate) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -545,12 +589,22 @@ func (p *Plugin) refresh(pods []k8stypes.NamespacedName) {
 		endpointLoad.WithLabelValues(name).Set(float64(load))
 	}
 
+	p.labelErrLogged.Range(func(key, _ any) bool {
+		if _, ok := present[key.(string)]; !ok {
+			p.labelErrLogged.Delete(key)
+		}
+		return true
+	})
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	bucketTokens.Reset()
 	for id, b := range p.buckets {
 		name, ok := present[id]
 		if !ok {
+			// A one-tick inventory drop lands here too: the bucket (and any debt)
+			// is forgotten and restarts empty if the endpoint comes back, which
+			// can only move less than the surviving bucket would (conservative).
 			delete(p.buckets, id)
 			continue
 		}

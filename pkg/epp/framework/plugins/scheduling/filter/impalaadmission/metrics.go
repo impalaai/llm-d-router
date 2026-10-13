@@ -70,7 +70,7 @@ var (
 
 	labelErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "impala_admission_label_errors_total",
-		Help: metricsutil.HelpMsgWithStability("Endpoints seen with malformed or unknown impala.ai/* labels (treated as active).", compbasemetrics.ALPHA),
+		Help: metricsutil.HelpMsgWithStability("Malformed or unknown impala.ai/* label sets seen, counted per candidate evaluation (a persistent bad label counts once per candidate per request; treated as active).", compbasemetrics.ALPHA),
 	})
 
 	panicsTotal = prometheus.NewCounter(prometheus.CounterOpts{

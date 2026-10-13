@@ -115,6 +115,20 @@ var impalaRequestSeq int64
 
 // endpointID is the datastore's endpoint ID.Name of k8s-style harness pod
 // <index>, which is what every impala_* metric carries as its `endpoint` label.
+// impalaLabelPrefix is the namespace of the lifecycle labels these tests drive.
+const impalaLabelPrefix = "impala.ai/"
+
+// hasImpalaLabel reports whether any impala.ai/* lifecycle label is still
+// visible; it is the "settled" predicate for clearing a pod's labels.
+func hasImpalaLabel(labels map[string]string) bool {
+	for k := range labels {
+		if strings.HasPrefix(k, impalaLabelPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func endpointID(index int) string { return fmt.Sprintf("pod-%d-rank-0", index) }
 
 // endpointAddr is the address the harness gives pod <index>.
@@ -288,7 +302,7 @@ func TestImpalaAdmission_RetainKeepsBoundSessionsAndSteersNewOnes(t *testing.T) 
 	labelErrorsBefore := impalaMetric(t, "impala_admission_label_errors_total", nil)
 	panicsBefore := impalaMetric(t, "impala_admission_panics_total", nil)
 
-	h.SetPodLabels(homeIdx, map[string]string{"impala.ai/state": "draining", "impala.ai/phase": "retain"})
+	h.SetPodLabels(homeIdx, map[string]string{"impala.ai/state": "draining", "impala.ai/phase": "retain"}, nil)
 
 	for range 5 {
 		assert.Equal(t, home, routeSession(t, h, "s-bound", "200"), "a bound session stays on its draining endpoint")
@@ -318,7 +332,7 @@ func TestImpalaAdmission_RetainKeepsBoundSessionsAndSteersNewOnes(t *testing.T) 
 	}, 25*time.Second, 500*time.Millisecond, "refresh never published bindings=1, load=1 for %s", homeName)
 
 	// label removed -> active again; the plugin is a pass-through and the session is still bound
-	h.SetPodLabels(homeIdx, nil)
+	h.SetPodLabels(homeIdx, nil, func(observed map[string]string) bool { return !hasImpalaLabel(observed) })
 	assert.Equal(t, home, routeSession(t, h, "s-bound", "200"))
 }
 
@@ -399,7 +413,7 @@ func TestImpalaAdmission_PrefixOnlyRetainsHistoryAndSteersFreshConversations(t *
 	retainedBefore := impalaMetric(t, "impala_admission_decisions_total", retained)
 	steeredBefore := impalaMetric(t, "impala_admission_decisions_total", steered)
 
-	h.SetPodLabels(homeIdx, map[string]string{"impala.ai/state": "draining", "impala.ai/phase": "retain"})
+	h.SetPodLabels(homeIdx, map[string]string{"impala.ai/state": "draining", "impala.ai/phase": "retain"}, nil)
 
 	// Later turns of the same conversation hold a four-block advantage on the
 	// draining endpoint: retained.

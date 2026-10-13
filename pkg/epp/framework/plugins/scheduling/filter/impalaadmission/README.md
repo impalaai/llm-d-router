@@ -29,11 +29,11 @@ to `[draining engine]` nothing downstream can move it.
 |---|---|---|
 | `impala.ai/state` | `warming`, `draining` (absent = active) | always |
 | `impala.ai/phase` | `retain`, `migrate` | draining |
-| `impala.ai/share` | decimal in `[0,1]` (`1` and `1.0` both full; `"0.25 "` is malformed) | warming |
+| `impala.ai/share` | decimal in `[0,1]`, at most four places (`^(0(\.[0-9]{1,4})?\|1(\.0{1,4})?)$`; `1` and `1.0` both full; `"0.25 "`, `+0.5`, `.5`, `1e0` and hex floats are malformed) | warming |
 | `impala.ai/budget-tpm` | positive integer, tokens/min for THIS EPP replica | migrate |
 | `impala.ai/box` | any string; same-box sibling preference on a move | optional |
 
-Malformed or unknown values make the endpoint active and increment `impala_admission_label_errors_total`.
+Malformed or unknown values make the endpoint active and increment `impala_admission_label_errors_total` once per candidate evaluation; an explicit `impala.ai/state=active` is accepted silently. The counter has no endpoint label, so the offender is named once at Info (per distinct endpoint and error; forgotten when it parses cleanly again) in the EPP log.
 
 ## Rules (per request)
 
@@ -47,7 +47,7 @@ Malformed or unknown values make the endpoint active and increment `impala_admis
   `[W]` with probability `share` (several warming endpoints split it), unless W's load ≥
   mean(load of the non-warming kept candidates) + 1. Load = recent bindings on session planes,
   in-flight requests on prefix planes (see below).
-- Never empty; panics recovered (pass-through, counted).
+- Never empty; panics recovered (pass-through, counted). When the draining endpoint is the only candidate left (a pool of one, or the health gate removed the rest) the request stays on it, the migrate bucket is refunded and no `moved`/`steered` decision or moved tokens are recorded.
 
 ## Load signal
 

@@ -20,8 +20,14 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strconv"
 )
+
+// shareGrammar is the llmd-manager's share_str: the writer emits at most four
+// decimals in [0, 1]. Matching it before ParseFloat keeps hex floats ("0x1p-2"),
+// a leading "+", exponents and the like out, which ParseFloat alone would take.
+var shareGrammar = regexp.MustCompile(`^(0(\.[0-9]{1,4})?|1(\.0{1,4})?)$`)
 
 // Endpoint labels the llmd-manager writes into inventory.list and the resolver
 // renders into /shared/endpoints.yaml (spec §4.1). file-discovery copies them
@@ -63,16 +69,20 @@ func parseLifecycle(labels map[string]string) (lifecycle, error) {
 		return lc, nil
 	}
 	switch state {
+	case StateActive:
+		// The manager never writes it (active = label absent), but an explicit
+		// "active" is plain and not an error.
+		return lc, nil
 	case StateWarming:
 		raw, ok := labels[LabelShare]
 		if !ok {
 			return lc, fmt.Errorf("%s=warming requires %s", LabelState, LabelShare)
 		}
-		// strconv.ParseFloat is strict: "0.25 " (trailing space) and "" fail,
-		// "1" and "1.0" both parse to 1.
+		// The grammar rejects "0.25 " (trailing space), "" and hex floats; "1"
+		// and "1.0" both parse to 1.
 		share, err := strconv.ParseFloat(raw, 64)
-		if err != nil || math.IsNaN(share) || math.IsInf(share, 0) || share < 0 || share > 1 {
-			return lc, fmt.Errorf("%s=%q is not a decimal in [0,1]", LabelShare, raw)
+		if !shareGrammar.MatchString(raw) || err != nil || math.IsNaN(share) || share < 0 || share > 1 {
+			return lc, fmt.Errorf("%s=%q is not a decimal in [0,1] with at most four places", LabelShare, raw)
 		}
 		lc.State, lc.Share = StateWarming, share
 		return lc, nil
