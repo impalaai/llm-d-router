@@ -18,9 +18,12 @@ package sessionaffinity
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -171,4 +174,23 @@ func TestSessionIDHeaderFilter_NeverNarrowsToEmpty(t *testing.T) {
 			t.Errorf("filter with empty input = %d endpoints, want 0", len(got))
 		}
 	})
+}
+
+// --- impala fork: BindingLookup accessor -------------------------------------
+
+func TestBindingLookup_ExposedOnlyForSessionIDStrategy(t *testing.T) {
+	handle := utils.NewTestHandle(utils.NewTestContext(t))
+
+	sessionID, err := Factory("sa", json.NewDecoder(strings.NewReader(
+		`{"strategy":"session_id","sessionIdConfig":{"sources":[{"header":"x-session-id"}]}}`)), handle)
+	require.NoError(t, err)
+	lookup, ok := sessionID.(*SessionAffinity).BindingLookup()
+	require.True(t, ok)
+	require.NotNil(t, lookup)
+
+	encoded, err := Factory("enc", nil, handle) // default strategy: encoded_endpoint_header
+	require.NoError(t, err)
+	lookup, ok = encoded.(*SessionAffinity).BindingLookup()
+	assert.False(t, ok)
+	assert.Nil(t, lookup)
 }

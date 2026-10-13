@@ -365,6 +365,97 @@ per-endpoint gauges are updated as requests are admitted and released.
 *   **Description:** Tokens currently in flight on each endpoint — uncached prompt tokens, optionally plus estimated output tokens when the producer's `addEstimatedOutputTokens` is set.
 *   **Usage:** Per-replica token pressure, a finer load signal than request count when request sizes vary widely.
 
+### Impala admission (fork)
+
+Impala fork only: emitted by the `impala-admission-filter` plugin
+(`pkg/epp/framework/plugins/scheduling/filter/impalaadmission`). These series carry NO subsystem
+prefix (bare `impala_` names). The collectors are package-global, so one filter instance per EPP
+process is supported. The per-endpoint gauges are published as soon as discovery lists endpoints,
+then every 15 s for every endpoint in the pool. `endpoint` is the endpoint's file-discovery `name`.
+
+#### `impala_admission_decisions_total`
+
+*   **Type:** Counter
+*   **Labels:**
+    *   `endpoint`: string — the endpoint the decision concerns.
+    *   `state`: string — `warming` or `draining`.
+    *   `phase`: string — `retain` or `migrate` for draining endpoints, empty otherwise.
+    *   `decision`: string — `retained`, `steered`, `moved`, `deferred` or `forced`.
+*   **Release Stage:** ALPHA
+*   **Description:** Admission decisions per endpoint, lifecycle state/phase and outcome.
+*   **Usage:** Watch a draining endpoint's `retained` vs `steered`/`moved`, and `forced` on a warming endpoint to see whether it is being picked. All series absent or flat means the plugin is dark.
+
+#### `impala_admission_moved_tokens_total`
+
+*   **Type:** Counter
+*   **Labels:**
+    *   `endpoint`: string — the draining endpoint work was moved off.
+*   **Release Stage:** ALPHA
+*   **Description:** Prefix tokens the filter chose to re-prefill elsewhere by moving work off a draining endpoint.
+*   **Usage:** Rate against the endpoint's `impala.ai/budget-tpm` to confirm migration stays inside budget.
+
+#### `impala_admission_bucket_tokens`
+
+*   **Type:** Gauge
+*   **Labels:**
+    *   `endpoint`: string — the draining (migrate) endpoint.
+*   **Release Stage:** ALPHA
+*   **Description:** Migrate token-bucket level after the last take on this EPP replica; negative while in debt.
+*   **Usage:** Shows how much migration headroom remains; per replica, so the budget is per-replica.
+
+#### `impala_admission_endpoint_load`
+
+*   **Type:** Gauge
+*   **Labels:**
+    *   `endpoint`: string — the endpoint.
+*   **Release Stage:** ALPHA
+*   **Description:** The load value the warming overload stop uses. Session planes: bindings refreshed within `recentBindingWindowSeconds` (up to 15 s old). Prefix-only planes: in-flight requests from upstream `GetRequests` on the `inflight-load-producer`, per `PodList` ID.
+*   **Usage:** Presence is the liveness signal for the plugin; a ramp controller can compare a warming endpoint's value to its peers.
+
+#### `impala_session_bindings`
+
+*   **Type:** Gauge
+*   **Labels:**
+    *   `endpoint`: string — the endpoint.
+*   **Release Stage:** ALPHA
+*   **Description:** Unexpired session bindings per endpoint. Session planes only (`sessionAffinityPluginName` set).
+*   **Usage:** How many sessions an endpoint holds, e.g. how much a draining endpoint still has to shed.
+
+#### `impala_session_bindings_recent`
+
+*   **Type:** Gauge
+*   **Labels:**
+    *   `endpoint`: string — the endpoint.
+*   **Release Stage:** ALPHA
+*   **Description:** Session bindings per endpoint refreshed within `recentBindingWindowSeconds`. Session planes only.
+*   **Usage:** Active-session count per endpoint; the warming load on session planes.
+
+#### `impala_endpoint_errors_total`
+
+*   **Type:** Counter
+*   **Labels:**
+    *   `endpoint`: string — the endpoint that served the response.
+    *   `code`: string — the HTTP status code (400-599).
+*   **Release Stage:** ALPHA
+*   **Description:** Model-server responses with an HTTP status in 400-599, by serving endpoint, from the plugin's ResponseHeader hook.
+*   **Usage:** Per-endpoint error gate for a newly added engine.
+
+#### `impala_admission_label_errors_total`
+
+*   **Type:** Counter
+*   **Labels:** none
+*   **Release Stage:** ALPHA
+*   **Description:** Malformed or unknown `impala.ai/*` label sets seen, counted per candidate evaluation (a persistent bad label counts once per candidate per request; treated as active).
+*   **Usage:** Any increase means a label writer produced a value the filter rejects. The counter carries no endpoint label; the offending endpoint is named once at Info in the EPP log (`malformed lifecycle label`).
+
+#### `impala_admission_panics_total`
+
+*   **Type:** Counter
+*   **Labels:** none
+*   **Release Stage:** ALPHA
+*   **Description:** Panics recovered inside the filter (Filter passes its candidates through unchanged; a refresh is skipped).
+*   **Usage:** Should stay zero; any increase is a bug.
+
 ### KV-cache index
 
 Prefix `llm_d_router_epp_`. Registered only when the embedded llm-d-kv-cache metrics are enabled (see

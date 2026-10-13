@@ -161,3 +161,14 @@ func (s *SessionAffinity) PreRequest(ctx context.Context, request *scheduling.In
 func (s *SessionAffinity) ResponseHeader(ctx context.Context, request *scheduling.InferenceRequest, response *requestcontrol.Response, targetPod *datalayer.EndpointMetadata) {
 	s.strategy.responseHeader(ctx, request, response, targetPod)
 }
+
+// BindingLookup exposes the session_id binding store read-only (impala fork:
+// consumed by the impala-admission-filter through the plugin handle). ok is
+// false under the encoded_endpoint_header strategy, which keeps no store.
+func (s *SessionAffinity) BindingLookup() (sessionutil.BindingLookup, bool) {
+	strategy, ok := s.strategy.(*sessionIDHeaderStrategy)
+	if !ok || strategy == nil || strategy.SessionIDHeader == nil {
+		return nil, false
+	}
+	return strategy.SessionIDHeader, true
+}

@@ -20,6 +20,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"maps"
 	"net"
 	"strings"
 	"testing"
@@ -377,7 +378,7 @@ func (h *TestHarness) WithPods(pods []PodState) *TestHarness {
 		pod := testutil.MakePod(name).
 			Namespace(h.Namespace).
 			ReadyCondition(). // Sets Status.Conditions.
-			Labels(map[string]string{"app": testPoolName}).
+			Labels(podLabels(p.labels)).
 			IP(fmt.Sprintf("192.168.1.%d", p.index+1)).
 			Complete().
 			ObjRef()
@@ -395,6 +396,43 @@ func (h *TestHarness) WithPods(pods []PodState) *TestHarness {
 		require.NoError(h.t, k8sClient.Status().Update(h.ctx, pod), "failed to update status for pod %s", name)
 	}
 	return h
+}
+
+// podLabels merges extra labels over the pool selector label.
+func podLabels(extra map[string]string) map[string]string {
+	labels := map[string]string{"app": testPoolName}
+	maps.Copy(labels, extra)
+	return labels
+}
+
+// SetPodLabels replaces pod-<index>'s extra labels with a label-only Update
+// and blocks until the datastore's EndpointMetadata reflects them. Nothing
+// else about the pod changes, so this is the in-place metadata update path
+// (datastore.upsertEndpoint -> UpdateMetadata) a file-discovery label edit
+// takes in production. Every key in extra must be visible; settled, when
+// non-nil, is an additional predicate over the observed labels (e.g. "a label
+// I removed is gone") that must also hold.
+func (h *TestHarness) SetPodLabels(index int, extra map[string]string, settled func(observed map[string]string) bool) {
+	h.t.Helper()
+	name := fmt.Sprintf("pod-%d", index)
+	pod := &corev1.Pod{}
+	require.NoError(h.t, k8sClient.Get(h.ctx, types.NamespacedName{Namespace: h.Namespace, Name: name}, pod))
+	pod.Labels = podLabels(extra)
+	require.NoError(h.t, k8sClient.Update(h.ctx, pod))
+	require.Eventually(h.t, func() bool {
+		for _, ep := range h.Datastore.PodList(func(fwkdl.Endpoint) bool { return true }) {
+			if ep.GetMetadata().Name != name {
+				continue
+			}
+			for k, v := range extra {
+				if ep.GetMetadata().Labels[k] != v {
+					return false
+				}
+			}
+			return settled == nil || settled(ep.GetMetadata().Labels)
+		}
+		return false
+	}, 10*time.Second, 50*time.Millisecond, "datastore did not pick up the label change for %s", name)
 }
 
 // WaitForReadyPodsMetric blocks until the prometheus metric 'inference_pool_ready_pods' matches the expected count.

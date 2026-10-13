@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -575,4 +577,53 @@ func TestSessionIDConfig_Validate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- impala fork: read-only binding lookup -----------------------------------
+
+func bindForLookupTest(t *testing.T, s *SessionIDHeader, sessionID string, endpoint scheduling.Endpoint) {
+	t.Helper()
+	s.PreRequest(context.Background(), requestWithSession(sessionID), schedulingResultFor(endpoint))
+}
+
+func TestBindingLookup_ResolveSessionIDReadsConfiguredSource(t *testing.T) {
+	s := newTestSessionIDHeader(t, nil)
+	req := &scheduling.InferenceRequest{Headers: map[string]string{DefaultHeader: " s1 "}}
+	assert.Equal(t, "s1", s.ResolveSessionID(context.Background(), req))
+	assert.Equal(t, "", s.ResolveSessionID(context.Background(), &scheduling.InferenceRequest{}))
+}
+
+func TestBindingLookup_BoundEndpointReturnsIDAndHonoursTTL(t *testing.T) {
+	s := newTestSessionIDHeader(t, func(o *testOptions) { o.evictionTTLSeconds = 60 })
+	a := newTestEndpoint("pod-a")
+	bindForLookupTest(t, s, "s1", a)
+
+	id, ok := s.BoundEndpoint("s1", time.Now())
+	require.True(t, ok)
+	assert.Equal(t, a.GetMetadata().ID.String(), id)
+
+	_, ok = s.BoundEndpoint("unknown", time.Now())
+	assert.False(t, ok)
+
+	_, ok = s.BoundEndpoint("s1", time.Now().Add(61*time.Second)) // expired but not yet swept
+	assert.False(t, ok)
+}
+
+func TestBindingLookup_BindingCountsSplitsRecentFromTotal(t *testing.T) {
+	s := newTestSessionIDHeader(t, func(o *testOptions) { o.evictionTTLSeconds = 3600 })
+	a, b := newTestEndpoint("pod-a"), newTestEndpoint("pod-b")
+	bindForLookupTest(t, s, "s1", a)
+	bindForLookupTest(t, s, "s2", a)
+	bindForLookupTest(t, s, "s3", b)
+
+	now := time.Now()
+	counts := s.BindingCounts(10*time.Minute, now)
+	assert.Equal(t, BindingCounts{Total: 2, Recent: 2}, counts[a.GetMetadata().ID.String()])
+	assert.Equal(t, BindingCounts{Total: 1, Recent: 1}, counts[b.GetMetadata().ID.String()])
+
+	later := s.BindingCounts(10*time.Minute, now.Add(11*time.Minute))
+	assert.Equal(t, BindingCounts{Total: 2, Recent: 0}, later[a.GetMetadata().ID.String()])
+
+	expired := s.BindingCounts(10*time.Minute, now.Add(2*time.Hour))
+	assert.Empty(t, expired)
 }

@@ -346,6 +346,14 @@ type PodState struct {
 	queueSize    int
 	kvCacheUsage float64
 	activeModels []string
+	labels       map[string]string // extra pod labels, merged over the pool selector label
+}
+
+// WithLabels returns a copy of p carrying extra pod labels (impala fork: the
+// impala.ai/* lifecycle labels the admission filter reads).
+func (p PodState) WithLabels(labels map[string]string) PodState {
+	p.labels = labels
+	return p
 }
 
 // P constructs a Pod State: Index, Queue, KV%, Models...
