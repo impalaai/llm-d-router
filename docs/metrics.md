@@ -456,6 +456,88 @@ then every 15 s for every endpoint in the pool. `endpoint` is the endpoint's fil
 *   **Description:** Panics recovered inside the filter (Filter passes its candidates through unchanged; a refresh is skipped).
 *   **Usage:** Should stay zero; any increase is a bug.
 
+### Impala rate limit (fork)
+
+Impala fork only: emitted by the `impala-rate-limit-filter` plugin
+(`pkg/epp/framework/plugins/scheduling/filter/impalaratelimit`). These series carry NO subsystem
+prefix (bare `impala_` names). The collectors are package-global, so one filter instance per EPP
+process is supported. `endpoint` is the endpoint's file-discovery `name`; `dimension` is `rpm` or `tpm`.
+The gauges are republished every 5 s; series of endpoints that left the pool are deleted.
+
+#### `impala_rate_limit_engine_rate`
+
+*   **Type:** Gauge
+*   **Labels:**
+    *   `endpoint`: string — the endpoint.
+    *   `dimension`: string — `rpm` or `tpm`.
+*   **Release Stage:** ALPHA
+*   **Description:** Measured engine throughput per minute over the plugin's window: requests (rpm) or uncached prompt + generated tokens (tpm). Absent while unmeasured.
+*   **Usage:** Published for every polled engine, limited or not: use it to calibrate limits.
+
+#### `impala_rate_limit_limit`
+
+*   **Type:** Gauge
+*   **Labels:**
+    *   `endpoint`: string — the endpoint.
+    *   `dimension`: string — `rpm` or `tpm`.
+*   **Release Stage:** ALPHA
+*   **Description:** Configured per-minute limit from the endpoint's impala.ai/limit-* label (absent when none).
+*   **Usage:** Compare with `impala_rate_limit_engine_rate` to see headroom.
+
+#### `impala_rate_limit_unmeasured`
+
+*   **Type:** Gauge
+*   **Labels:**
+    *   `endpoint`: string — the endpoint.
+    *   `dimension`: string — `rpm` or `tpm`.
+*   **Release Stage:** ALPHA
+*   **Description:** 1 while a limited dimension has no measurement (warm-up, failing polls, missing vLLM family) and so cannot limit; 0 otherwise.
+*   **Usage:** A persistent 1 on a limited endpoint means the limit is not being enforced.
+
+#### `impala_rate_limit_over`
+
+*   **Type:** Gauge
+*   **Labels:**
+    *   `endpoint`: string — the endpoint.
+    *   `dimension`: string — `rpm` or `tpm`.
+*   **Release Stage:** ALPHA
+*   **Description:** 1 while the measured rate is at or above the limit, 0 otherwise.
+*   **Usage:** Shows which engines are currently being steered away from.
+
+#### `impala_rate_limit_dropped_total`
+
+*   **Type:** Counter
+*   **Labels:**
+    *   `endpoint`: string — the endpoint that was dropped.
+*   **Release Stage:** ALPHA
+*   **Description:** Candidates the filter dropped because the engine was at a limit.
+*   **Usage:** Rate shows how much work the guard is steering off an engine.
+
+#### `impala_rate_limit_fail_open_total`
+
+*   **Type:** Counter
+*   **Labels:** none
+*   **Release Stage:** ALPHA
+*   **Description:** Scheduling cycles in which every candidate was over a limit, so all were kept.
+*   **Usage:** Sustained increase means the whole pool is saturated and the guard is not protecting anything.
+
+#### `impala_rate_limit_label_errors_total`
+
+*   **Type:** Counter
+*   **Labels:**
+    *   `endpoint`: string — the endpoint with the malformed label.
+*   **Release Stage:** ALPHA
+*   **Description:** Malformed impala.ai/limit-* labels seen, per candidate evaluation (that dimension is not limited).
+*   **Usage:** Any increase means a label writer produced a value the filter rejects.
+
+#### `impala_rate_limit_panics_total`
+
+*   **Type:** Counter
+*   **Labels:** none
+*   **Release Stage:** ALPHA
+*   **Description:** Panics recovered inside impala-rate-limit-filter (Filter passes its candidates through; a publish is skipped).
+*   **Usage:** Should stay zero; any increase is a bug.
+
 ### KV-cache index
 
 Prefix `llm_d_router_epp_`. Registered only when the embedded llm-d-kv-cache metrics are enabled (see
