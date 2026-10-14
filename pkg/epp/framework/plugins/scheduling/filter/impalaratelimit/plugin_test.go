@@ -22,9 +22,11 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -361,13 +363,141 @@ func TestPublish_PrunesEndpointsThatLeftThePool(t *testing.T) {
 	assert.Empty(t, series(t, engineRate))
 	assert.Empty(t, series(t, limitGauge))
 	assert.NotContains(t, p.endpoints, meta("a", nil).ID.String())
-	p.publishOnce(nil) // an empty pod list (datastore not filled yet) prunes nothing
 }
 
-func TestFactory_PublishLoopRunsUntilTheContextEnds(t *testing.T) {
+func TestPublish_AnEmptyPodListPrunesNothing(t *testing.T) {
+	// At startup the datastore is empty until the config has loaded: that must not wipe state.
+	p, clock := newTestPlugin(t)
+	lim := map[string]string{LabelLimitRPM: "5"}
+	steady(t, p, clock, "a", lim, 30, 0, 0, 0, 60)
+	p.publishOnce(ids("a"))
+	require.Equal(t, 30.0, series(t, engineRate)[dimRPM])
+
+	p.publishOnce(nil)
+	assert.Contains(t, p.endpoints, meta("a", nil).ID.String(), "the endpoint state survives")
+	assert.Equal(t, 30.0, series(t, engineRate)[dimRPM], "its series survive and are republished")
+	assert.Equal(t, 5.0, series(t, limitGauge)[dimRPM])
+}
+
+func TestPublishLoop_PublishesPeriodicallyAndStopsWithTheContext(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	var calls atomic.Int64
+	podList := func() []k8stypes.NamespacedName { calls.Add(1); return ids("a") }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { p.publishLoop(ctx, podList, 5*time.Millisecond); close(done) }()
+
+	require.Eventually(t, func() bool { return calls.Load() >= 3 }, 2*time.Second, 5*time.Millisecond,
+		"the loop publishes on every tick")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("publishLoop did not return after its context was cancelled")
+	}
+	settled := calls.Load()
+	time.Sleep(30 * time.Millisecond)
+	assert.Equal(t, settled, calls.Load(), "no publish after the loop returned")
+}
+
+func TestFactory_StartsThePublishLoopOnTheHandleContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(utils.NewTestContext(t))
-	h := utils.NewTestHandle(ctx)
-	_, err := Factory("rl", nil, h)
+	defer cancel()
+	_, err := Factory("rl", nil, utils.NewTestHandle(ctx))
 	require.NoError(t, err)
-	cancel() // the loop exits on ctx.Done(); -race would flag a leak touching shared state
+}
+
+func TestFilter_APanicInsideTheLockedSectionDoesNotWedgeThePlugin(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	lim := map[string]string{LabelLimitRPM: "1"}
+	// A state with no window makes st.win.rates panic while p.mu is held.
+	p.endpoints[meta("a", nil).ID.String()] = &endpointState{name: "a"}
+	in := []fwksched.Endpoint{candidate("a", lim)}
+	before := testutil.ToFloat64(panicsTotal)
+
+	assert.Equal(t, []string{"a"}, names(p.Filter(context.Background(), nil, in)))
+	assert.Equal(t, 1.0, testutil.ToFloat64(panicsTotal)-before)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.Filter(context.Background(), nil, in)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Filter blocked: the mutex was left locked by the panic")
+	}
+	assert.Equal(t, 2.0, testutil.ToFloat64(panicsTotal)-before)
+	// Extract takes the same mutex; it must not block either.
+	extracted := make(chan struct{})
+	go func() {
+		defer close(extracted)
+		_ = p.Extract(context.Background(), fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{
+			Payload:  parseText(t, vllmText(1, 1, 1, 0)),
+			Endpoint: fwkdl.NewEndpoint(meta("b", nil), nil),
+		})
+	}()
+	select {
+	case <-extracted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Extract blocked: the mutex was left locked by the panic")
+	}
+}
+
+func TestTransitionLog_OneLinePerThirtySecondsAndTheFinalStateIsNeverLost(t *testing.T) {
+	p, clock := newTestPlugin(t)
+	var mu sync.Mutex
+	var lines []string
+	p.logger = funcr.New(func(_, args string) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, args)
+	}, funcr.Options{Verbosity: 0})
+	count := func() int { mu.Lock(); defer mu.Unlock(); return len(lines) }
+	last := func() string { mu.Lock(); defer mu.Unlock(); return lines[len(lines)-1] }
+
+	over := map[string]string{LabelLimitRPM: "60"}    // measured 60 rpm: at the limit
+	roomy := map[string]string{LabelLimitRPM: "1000"} // the same traffic is far below it
+	steady(t, p, clock, "a", over, 60, 0, 0, 0, 60)   // leaves the counter at 60
+	next := 61.0
+	step := func(lbl map[string]string) {
+		poll(t, p, "a", lbl, vllmText(next, 0, 0, 0))
+		next++
+		clock.Advance(time.Second)
+		p.publishOnce(ids("a"))
+	}
+
+	// (a) the first transition is logged at once.
+	step(over)
+	require.Equal(t, 1, count())
+	assert.Contains(t, last(), "at its limit")
+	assert.Contains(t, last(), `"suppressedTransitions"=0`)
+	loggedAt := clock.Now()
+
+	// (b) flipping back within 30 s logs nothing.
+	step(roomy)
+	assert.Equal(t, 1, count())
+
+	// (d, part 1) and nothing while the state holds and 30 s have not passed.
+	for clock.Now().Sub(loggedAt) < 29*time.Second {
+		step(roomy)
+		require.Equal(t, 1, count(), "at %s after the first line", clock.Now().Sub(loggedAt))
+	}
+
+	// (c) once 30 s have passed the CURRENT state is logged, with the suppressed count.
+	for i := 0; i < 5 && count() == 1; i++ {
+		step(roomy)
+	}
+	require.Equal(t, 2, count())
+	assert.Contains(t, last(), "stopped being limited")
+	assert.NotContains(t, last(), `"suppressedTransitions"=0`)
+	assert.GreaterOrEqual(t, clock.Now().Sub(loggedAt), 30*time.Second)
+
+	// (d) no further lines while the state is unchanged.
+	for range 40 {
+		step(roomy)
+	}
+	assert.Equal(t, 2, count())
 }

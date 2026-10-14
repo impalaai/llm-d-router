@@ -77,9 +77,10 @@ type endpointState struct {
 	name       string // EndpointMetadata.ID.Name: the metrics `endpoint` label
 	win        *window
 	limits     limits // last parsed, by Extract (every stored sample) or Filter (every request)
-	limited    bool   // last published "over on some dimension"
+	limited    bool   // current "over on some dimension", as of the last publish
+	logged     bool   // the "limited" state the last transition line reported
 	lastLog    time.Time
-	suppressed int
+	suppressed int // transitions not logged since lastLog
 }
 
 // Plugin is impala-rate-limit-filter: the extractor role fills each endpoint's window from the
@@ -127,7 +128,7 @@ func Factory(name string, raw *json.Decoder, handle fwkplugin.Handle) (fwkplugin
 		ctx = context.Background()
 	}
 	p.logger = log.FromContext(ctx)
-	go p.publishLoop(ctx, handle, publishInterval)
+	go p.publishLoop(ctx, handle.PodList, publishInterval)
 	return p, nil
 }
 
@@ -198,24 +199,34 @@ func (p *Plugin) Filter(ctx context.Context, _ *fwksched.InferenceRequest, endpo
 		lims[i], err = parseLimits(ep.GetMetadata().Labels)
 		p.noteLabelError(ctx, ep.GetMetadata(), err)
 	}
-	over := make([]bool, len(endpoints))
+	kept := p.decide(endpoints, lims, now)
+	if len(kept) == 0 {
+		failOpenTotal.Inc()
+		return endpoints
+	}
+	return kept
+}
+
+// decide returns the candidates that are not over a limit and counts the dropped ones, or nil
+// when every candidate is over (the caller then fails open and nothing is counted as dropped).
+// Everything runs under the mutex, released by defer so a panic cannot leave it held, and the
+// drops are counted before it is released so a concurrent prune cannot be followed by a
+// resurrected series.
+func (p *Plugin) decide(endpoints []fwksched.Endpoint, lims []limits, now time.Time) []fwksched.Endpoint {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	over := make([]bool, len(endpoints))
+	kept := make([]fwksched.Endpoint, 0, len(endpoints))
 	for i, ep := range endpoints {
 		st := p.stateLocked(ep.GetMetadata())
 		st.limits = lims[i] // so the publish loop reports a limited endpoint even if its polls never succeed
 		over[i] = overLimit(lims[i], st.win.rates(now))
-	}
-	p.mu.Unlock()
-
-	kept := make([]fwksched.Endpoint, 0, len(endpoints))
-	for i, ep := range endpoints {
 		if !over[i] {
 			kept = append(kept, ep)
 		}
 	}
 	if len(kept) == 0 {
-		failOpenTotal.Inc()
-		return endpoints
+		return nil
 	}
 	for i, ep := range endpoints {
 		if over[i] {
@@ -250,7 +261,7 @@ func (p *Plugin) noteLabelError(ctx context.Context, md *fwkdl.EndpointMetadata,
 		"endpoint", md.ID.Name, "error", msg)
 }
 
-func (p *Plugin) publishLoop(ctx context.Context, handle fwkplugin.Handle, interval time.Duration) {
+func (p *Plugin) publishLoop(ctx context.Context, podList func() []k8stypes.NamespacedName, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -258,7 +269,7 @@ func (p *Plugin) publishLoop(ctx context.Context, handle fwkplugin.Handle, inter
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			p.publishOnce(handle.PodList())
+			p.publishOnce(podList())
 		}
 	}
 }
@@ -321,15 +332,18 @@ func (p *Plugin) publishLocked(st *endpointState, now time.Time) {
 	p.noteTransitionLocked(st, limited, r, now)
 }
 
-// noteTransitionLocked logs a limited/unlimited flip at most once per transitionLogEvery per
-// endpoint; an engine hovering at its limit flips often and would otherwise flood the log.
+// noteTransitionLocked logs when an endpoint starts or stops being limited, at most once per
+// transitionLogEvery per endpoint. It compares the CURRENT state with the state the last line
+// reported, so a line suppressed by the cap is not lost: the next publish after the cap
+// expires logs the then-current state, with the number of transitions it covers. A flip back to
+// the already-logged state needs no line.
 func (p *Plugin) noteTransitionLocked(st *endpointState, limited bool, r rates, now time.Time) {
-	if limited == st.limited {
-		return
-	}
+	changed := limited != st.limited
 	st.limited = limited
-	if !st.lastLog.IsZero() && now.Sub(st.lastLog) < transitionLogEvery {
-		st.suppressed++
+	if limited == st.logged || (!st.lastLog.IsZero() && now.Sub(st.lastLog) < transitionLogEvery) {
+		if changed {
+			st.suppressed++
+		}
 		return
 	}
 	msg := "impala-rate-limit-filter: endpoint stopped being limited"
@@ -338,7 +352,7 @@ func (p *Plugin) noteTransitionLocked(st *endpointState, limited bool, r rates, 
 	}
 	p.logger.Info(msg, "endpoint", st.name, "rpm", r.RPM, "tpm", r.TPM,
 		"limitRPM", st.limits.RPM, "limitTPM", st.limits.TPM, "suppressedTransitions", st.suppressed)
-	st.lastLog, st.suppressed = now, 0
+	st.logged, st.lastLog, st.suppressed = limited, now, 0
 }
 
 func boolf(b bool) float64 {
