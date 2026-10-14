@@ -30,7 +30,7 @@ func TestParseLimits(t *testing.T) {
 		wantErr string
 	}{
 		{name: "none", labels: nil, want: limits{}},
-		{name: "unrelated labels", labels: map[string]string{"impala.ai/box": "eu6", "impala.ai/state": "draining"}, want: limits{}},
+		{name: "unrelated labels", labels: map[string]string{"impala.ai/box": "a", "impala.ai/state": "draining"}, want: limits{}},
 		{name: "rpm only", labels: map[string]string{LabelLimitRPM: "30"}, want: limits{RPM: 30}},
 		{name: "tpm only", labels: map[string]string{LabelLimitTPM: "3000000"}, want: limits{TPM: 3000000}},
 		{name: "both", labels: map[string]string{LabelLimitRPM: "30", LabelLimitTPM: "2000000"}, want: limits{RPM: 30, TPM: 2000000}},

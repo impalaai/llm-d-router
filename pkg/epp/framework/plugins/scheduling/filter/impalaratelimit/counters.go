@@ -52,7 +52,7 @@ func readCounters(families sourcemetrics.PrometheusMetricMap) counters {
 
 // sumFamily adds up every series of a family, so per-`engine` (data parallel) and other label
 // splits all count. A family missing under its name is looked up without the _total suffix
-// (an exporter whose # TYPE line names the bare counter).
+// (an exporter whose counter SAMPLE name lacks _total, e.g. OpenMetrics-style).
 func sumFamily(families sourcemetrics.PrometheusMetricMap, name string) (float64, bool) {
 	f, ok := families[name]
 	if !ok || f == nil {

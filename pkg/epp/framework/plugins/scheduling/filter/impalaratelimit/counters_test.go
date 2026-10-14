@@ -96,7 +96,7 @@ vllm:external_prefix_cache_hits_total{engine="0",model_name="m"} 42
 
 func TestReadCounters_FindsAFamilyWhoseTypeLineDropsTotal(t *testing.T) {
 	text := `# TYPE vllm:prompt_tokens counter
-vllm:prompt_tokens_total{engine="0",model_name="m"} 900
+vllm:prompt_tokens{engine="0",model_name="m"} 900
 `
 	c := readCounters(parseText(t, text))
 	assert.True(t, c.HasPrompt)
