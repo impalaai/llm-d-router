@@ -1,0 +1,43 @@
+# HELP vllm:time_to_first_token_seconds Histogram of time to first token in seconds.
+# TYPE vllm:time_to_first_token_seconds histogram
+vllm:time_to_first_token_seconds_sum{engine="0",model_name="gpt-oss-120b"} 774621.3611929417
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.001",model_name="gpt-oss-120b"} 0.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.005",model_name="gpt-oss-120b"} 0.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.01",model_name="gpt-oss-120b"} 0.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.02",model_name="gpt-oss-120b"} 140.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.04",model_name="gpt-oss-120b"} 41304.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.06",model_name="gpt-oss-120b"} 56734.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.08",model_name="gpt-oss-120b"} 233863.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.1",model_name="gpt-oss-120b"} 307313.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.25",model_name="gpt-oss-120b"} 597826.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.5",model_name="gpt-oss-120b"} 842311.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="0.75",model_name="gpt-oss-120b"} 958173.0
+vllm:time_to_first_token_seconds_bucket{engine="0",le="1.0",model_name="gpt-oss-120b"} 1.029442e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="2.5",model_name="gpt-oss-120b"} 1.173897e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="5.0",model_name="gpt-oss-120b"} 1.216161e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="7.5",model_name="gpt-oss-120b"} 1.225254e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="10.0",model_name="gpt-oss-120b"} 1.228747e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="20.0",model_name="gpt-oss-120b"} 1.231463e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="40.0",model_name="gpt-oss-120b"} 1.231579e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="80.0",model_name="gpt-oss-120b"} 1.231587e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="160.0",model_name="gpt-oss-120b"} 1.231587e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="640.0",model_name="gpt-oss-120b"} 1.231587e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="2560.0",model_name="gpt-oss-120b"} 1.231587e+06
+vllm:time_to_first_token_seconds_bucket{engine="0",le="+Inf",model_name="gpt-oss-120b"} 1.231587e+06
+vllm:time_to_first_token_seconds_count{engine="0",model_name="gpt-oss-120b"} 1.231587e+06
+# HELP vllm:prefix_cache_hits_total Prefix cache hits, in terms of number of cached tokens.
+# TYPE vllm:prefix_cache_hits_total counter
+vllm:prefix_cache_hits_total{engine="0",model_name="gpt-oss-120b"} 3.55911888e+08
+# HELP vllm:external_prefix_cache_hits_total External prefix cache hits from KV connector cross-instance cache sharing, in terms of number of cached tokens.
+# TYPE vllm:external_prefix_cache_hits_total counter
+vllm:external_prefix_cache_hits_total{engine="0",model_name="gpt-oss-120b"} 0.0
+# HELP vllm:prompt_tokens_total Number of prefill tokens processed.
+# TYPE vllm:prompt_tokens_total counter
+vllm:prompt_tokens_total{engine="0",model_name="gpt-oss-120b"} 1.6207610794e+010
+# HELP vllm:prompt_tokens_by_source_total Number of prompt tokens by source.
+# TYPE vllm:prompt_tokens_by_source_total counter
+# HELP vllm:prompt_tokens_cached_total Number of cached prompt tokens (local + external).
+# TYPE vllm:prompt_tokens_cached_total counter
+# HELP vllm:generation_tokens_total Number of generation tokens processed.
+# TYPE vllm:generation_tokens_total counter
+vllm:generation_tokens_total{engine="0",model_name="gpt-oss-120b"} 5.29435155e+08
