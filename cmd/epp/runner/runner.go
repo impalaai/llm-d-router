@@ -114,6 +114,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 	endpointattributefilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/endpointattribute"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/impalaadmission"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/impalaratelimit"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/prefixcacheaffinity"
 	sessionaffinityfilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sessionaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sloheadroomtier"
@@ -585,6 +586,9 @@ func (r *Runner) registerInTreePlugins() {
 	// impala fork: lifecycle admission gate (impala-gateway spec 2026-10-12). Registered
 	// with plugin dependencies so sessionAffinityPluginName orders construction.
 	fwkplugin.RegisterWithPluginDependencies(impalaadmission.PluginType, fwkplugin.StabilityAlpha, impalaadmission.Factory, impalaadmission.ConfigParser)
+	// impala fork: per-endpoint RPM/TPM overload guard (impala-gateway spec 2026-10-13). Also a
+	// metrics extractor: it attaches itself to metrics-data-source via RegisterDependencies.
+	fwkplugin.Register(impalaratelimit.PluginType, fwkplugin.StabilityAlpha, impalaratelimit.Factory)
 
 	// dataparallel profile handler
 	// Beta

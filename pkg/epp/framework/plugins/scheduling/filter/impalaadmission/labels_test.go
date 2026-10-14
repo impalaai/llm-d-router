@@ -156,3 +156,15 @@ func TestParseLifecycle_ShareOutsideShareStrGrammarIsMalformed(t *testing.T) {
 		})
 	}
 }
+
+// Rate-limit labels share the impala.ai/ prefix (impala-gateway spec 2026-10-13 §5.2); the
+// admission parser must neither error on them nor change an endpoint's state because of them.
+func TestParseLifecycle_IgnoresRateLimitLabels(t *testing.T) {
+	lc, err := parseLifecycle(map[string]string{"impala.ai/limit-rpm": "30", "impala.ai/limit-tpm": "abc"})
+	require.NoError(t, err)
+	assert.Equal(t, StateActive, lc.State)
+	lc, err = parseLifecycle(map[string]string{"impala.ai/state": "draining", "impala.ai/phase": "retain", "impala.ai/limit-rpm": "30"})
+	require.NoError(t, err)
+	assert.Equal(t, StateDraining, lc.State)
+	assert.Equal(t, PhaseRetain, lc.Phase)
+}
