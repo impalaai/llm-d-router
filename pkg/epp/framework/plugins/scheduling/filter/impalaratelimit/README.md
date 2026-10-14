@@ -11,8 +11,10 @@ is dropped from the candidates; when every candidate is over, all are kept (fail
 ## Wiring
 
 Declare the plugin and reference it in the profile. Nothing else: it attaches itself as an extractor to the
-`metrics-data-source` the config loader injects into every config without explicit `dataLayer.sources`
-(`RegisterDependencies`, `IfMissing: Warn`). With no `metrics-data-source` it measures nothing and never drops.
+`metrics-data-source` (`RegisterDependencies`, `IfMissing: Warn`). The config loader injects that source
+whenever it is not already among `dataLayer.sources` and `dataLayer.injectDefaults` is not `false`
+(`pkg/epp/config/loader/defaults.go`, `ensureDataLayer`). With no `metrics-data-source` the plugin measures
+nothing and never drops.
 
 ## Placement
 
@@ -43,8 +45,13 @@ unmeasured (never silently total tokens).
 `impala_rate_limit_engine_rate{endpoint,dimension}`, `impala_rate_limit_limit{endpoint,dimension}`,
 `impala_rate_limit_unmeasured{endpoint,dimension}`, `impala_rate_limit_over{endpoint,dimension}` (gauges,
 republished every 5 s), `impala_rate_limit_dropped_total{endpoint}`, `impala_rate_limit_label_errors_total{endpoint}`,
-`impala_rate_limit_fail_open_total`, `impala_rate_limit_panics_total`. `engine_rate` is published for every polled
+`impala_rate_limit_fail_open_total{scope}`, `impala_rate_limit_panics_total`. `engine_rate` is published for every polled
 engine, limited or not, while its dimension is measured (calibration data).
+
+`fail_open_total{scope="pool"}` is the pool-saturation signal: every engine of the pool was over and all were
+kept (the candidate count was at least the pool size last seen, or no pool size is known yet).
+`scope="narrowed"` means a narrowed set was all over, typically a pinned session whose engine is over while
+other engines may still have headroom; it does not indicate saturation.
 
 A transition log line (INFO) marks an endpoint starting or ceasing to be limited: at most one line per endpoint
 per 30 s, and the final state is always logged (a line suppressed by the cap is emitted at the next publish after

@@ -33,6 +33,13 @@ const (
 	labelDimension = "dimension"
 	dimRPM         = "rpm"
 	dimTPM         = "tpm"
+
+	labelScope = "scope"
+	// scopePool: the whole pool was over (the candidate list was as large as the pool, or the
+	// pool size is not known yet). scopeNarrowed: an earlier stage (a session pin, admission or a
+	// health gate) narrowed the candidates and all of the narrowed set was over.
+	scopePool     = "pool"
+	scopeNarrowed = "narrowed"
 )
 
 var (
@@ -61,10 +68,10 @@ var (
 		Help: metricsutil.HelpMsgWithStability("Candidates the filter dropped because the engine was at a limit.", compbasemetrics.ALPHA),
 	}, []string{labelEndpoint})
 
-	failOpenTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	failOpenTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "impala_rate_limit_fail_open_total",
-		Help: metricsutil.HelpMsgWithStability("Scheduling cycles in which every candidate was over a limit, so all were kept.", compbasemetrics.ALPHA),
-	})
+		Help: metricsutil.HelpMsgWithStability("Scheduling cycles in which every candidate was over a limit, so all were kept. scope=pool: the candidates were the whole pool (pool saturation); scope=narrowed: an earlier stage narrowed them (e.g. a pinned session) and all of that set was over.", compbasemetrics.ALPHA),
+	}, []string{labelScope})
 
 	labelErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "impala_rate_limit_label_errors_total",

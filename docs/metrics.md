@@ -472,7 +472,7 @@ The gauges are republished every 5 s; series of endpoints that left the pool are
     *   `dimension`: string — `rpm` or `tpm`.
 *   **Release Stage:** ALPHA
 *   **Description:** Measured engine throughput per minute over the plugin's window: requests (rpm) or uncached prompt + generated tokens (tpm). Absent while unmeasured.
-*   **Usage:** Published for every polled engine, limited or not: use it to calibrate limits.
+*   **Usage:** Published for every polled engine whose dimension is measured, limited or not: use it to calibrate limits.
 
 #### `impala_rate_limit_limit`
 
@@ -516,10 +516,11 @@ The gauges are republished every 5 s; series of endpoints that left the pool are
 #### `impala_rate_limit_fail_open_total`
 
 *   **Type:** Counter
-*   **Labels:** none
+*   **Labels:**
+    *   `scope`: string — `pool` or `narrowed`. `pool`: the filter's candidates were the whole pool (candidate count at least the pool size last seen, or no pool size known yet). `narrowed`: an earlier stage (a session pin, admission or a health gate) had narrowed the candidates.
 *   **Release Stage:** ALPHA
-*   **Description:** Scheduling cycles in which every candidate was over a limit, so all were kept.
-*   **Usage:** Sustained increase means the whole pool is saturated and the guard is not protecting anything.
+*   **Description:** Scheduling cycles in which every candidate was over a limit, so all were kept. scope=pool: the candidates were the whole pool (pool saturation); scope=narrowed: an earlier stage narrowed them (e.g. a pinned session) and all of that set was over.
+*   **Usage:** `scope="pool"` is the pool-saturation signal: a sustained increase means every engine is at its limit and the guard is not protecting anything. `scope="narrowed"` means a narrowed set was all over (typically a pinned session whose engine is over while other engines may have headroom); it is not a saturation signal.
 
 #### `impala_rate_limit_label_errors_total`
 

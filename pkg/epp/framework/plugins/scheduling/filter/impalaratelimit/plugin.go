@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -93,6 +94,10 @@ type Plugin struct {
 
 	mu        sync.Mutex
 	endpoints map[string]*endpointState // EndpointMetadata.ID.String()
+
+	// poolSize is the pod count of the last non-empty pod list publishOnce saw (0 = unknown). Filter
+	// compares its candidate count with it to tell a pool-wide fail-open from a narrowed one.
+	poolSize atomic.Int64
 
 	// labelErrLogged maps an endpoint ID string to the label error last logged for it, so a
 	// persistent bad label is logged once, not per request (impalaadmission's pattern).
@@ -201,7 +206,11 @@ func (p *Plugin) Filter(ctx context.Context, _ *fwksched.InferenceRequest, endpo
 	}
 	kept := p.decide(endpoints, lims, now)
 	if len(kept) == 0 {
-		failOpenTotal.Inc()
+		scope := scopeNarrowed
+		if size := p.poolSize.Load(); size == 0 || int64(len(endpoints)) >= size {
+			scope = scopePool
+		}
+		failOpenTotal.WithLabelValues(scope).Inc()
 		return endpoints
 	}
 	return kept
@@ -285,6 +294,9 @@ func (p *Plugin) publishOnce(pods []k8stypes.NamespacedName) {
 			p.logger.Error(fmt.Errorf("%v", r), "impala-rate-limit-filter publish panicked; skipped", "plugin", p.typedName.String())
 		}
 	}()
+	if len(pods) > 0 {
+		p.poolSize.Store(int64(len(pods)))
+	}
 	present := make(map[string]struct{}, len(pods))
 	for _, id := range pods {
 		present[id.String()] = struct{}{}

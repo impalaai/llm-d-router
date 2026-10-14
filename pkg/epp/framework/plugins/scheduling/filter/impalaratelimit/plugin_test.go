@@ -59,6 +59,7 @@ func resetMetrics() {
 	overGauge.Reset()
 	droppedTotal.Reset()
 	labelErrorsTotal.Reset()
+	failOpenTotal.Reset()
 }
 
 func testHandle(t *testing.T) fwkplugin.Handle {
@@ -263,18 +264,71 @@ func TestFilter_MalformedLabelDisablesOnlyThatDimension(t *testing.T) {
 	assert.Equal(t, 1.0, testutil.ToFloat64(labelErrorsTotal.WithLabelValues("a")))
 }
 
+func failOpens(scope string) float64 { return testutil.ToFloat64(failOpenTotal.WithLabelValues(scope)) }
+
+// saturate makes every named engine measure 60 rpm (replaying the same minute for each), so a
+// limit of 10 rpm puts them all over.
+func saturate(t *testing.T, p *Plugin, clock *fakeClock, lim map[string]string, engines ...string) {
+	t.Helper()
+	start := clock.Now()
+	for _, n := range engines {
+		clock.Advance(start.Sub(clock.Now()))
+		steady(t, p, clock, n, lim, 60, 0, 0, 0, 60)
+	}
+}
+
 func TestFilter_FailsOpenWhenEveryCandidateIsOver(t *testing.T) {
 	p, clock := newTestPlugin(t)
 	lim := map[string]string{LabelLimitRPM: "10"}
-	steady(t, p, clock, "a", lim, 60, 0, 0, 0, 60)
-	clock.Advance(-61 * time.Second) // replay the same minute for b
-	steady(t, p, clock, "b", lim, 60, 0, 0, 0, 60)
-	before := testutil.ToFloat64(failOpenTotal)
+	saturate(t, p, clock, lim, "a", "b")
 	in := []fwksched.Endpoint{candidate("a", lim), candidate("b", lim)}
 	got := p.Filter(context.Background(), nil, in)
 	assert.Equal(t, []string{"a", "b"}, names(got))
-	assert.Equal(t, 1.0, testutil.ToFloat64(failOpenTotal)-before)
+	assert.Equal(t, 1.0, failOpens(scopePool), "the pool size is not known yet: counted as the pool")
+	assert.Equal(t, 0.0, failOpens(scopeNarrowed))
 	assert.Empty(t, series(t, droppedTotal), "nothing was dropped")
+}
+
+func TestFilter_FailOpenScope(t *testing.T) {
+	lim := map[string]string{LabelLimitRPM: "10"}
+	all := func() []fwksched.Endpoint {
+		return []fwksched.Endpoint{candidate("a", lim), candidate("b", lim), candidate("c", lim)}
+	}
+	t.Run("a narrowed set, all over, is scope=narrowed", func(t *testing.T) {
+		p, clock := newTestPlugin(t)
+		saturate(t, p, clock, lim, "a") // b and c are not over, the pool has 3 engines
+		p.publishOnce(ids("a", "b", "c"))
+		got := p.Filter(context.Background(), nil, all()[:1]) // a pinned session: the one engine
+		assert.Equal(t, []string{"a"}, names(got))
+		assert.Equal(t, 1.0, failOpens(scopeNarrowed))
+		assert.Equal(t, 0.0, failOpens(scopePool))
+	})
+	t.Run("the whole pool over is scope=pool", func(t *testing.T) {
+		p, clock := newTestPlugin(t)
+		saturate(t, p, clock, lim, "a", "b", "c")
+		p.publishOnce(ids("a", "b", "c"))
+		got := p.Filter(context.Background(), nil, all())
+		assert.Equal(t, []string{"a", "b", "c"}, names(got))
+		assert.Equal(t, 1.0, failOpens(scopePool))
+		assert.Equal(t, 0.0, failOpens(scopeNarrowed))
+	})
+	t.Run("a single-engine pool over is scope=pool", func(t *testing.T) {
+		p, clock := newTestPlugin(t)
+		saturate(t, p, clock, lim, "a")
+		p.publishOnce(ids("a"))
+		got := p.Filter(context.Background(), nil, all()[:1])
+		assert.Equal(t, []string{"a"}, names(got))
+		assert.Equal(t, 1.0, failOpens(scopePool))
+		assert.Equal(t, 0.0, failOpens(scopeNarrowed))
+	})
+	t.Run("an empty pod list keeps the last known pool size", func(t *testing.T) {
+		p, clock := newTestPlugin(t)
+		saturate(t, p, clock, lim, "a")
+		p.publishOnce(ids("a", "b", "c"))
+		p.publishOnce(nil)
+		p.Filter(context.Background(), nil, all()[:1])
+		assert.Equal(t, 1.0, failOpens(scopeNarrowed))
+	})
 }
 
 func TestFilter_EmptyInput(t *testing.T) {
