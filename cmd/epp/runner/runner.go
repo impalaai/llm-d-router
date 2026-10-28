@@ -1192,6 +1192,11 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 	}
 	pool := datalayer.NewEndpointPool(namespace, poolName)
 	ds := datastore.NewDatastore(r.servingCtx, epf).WithEndpointPool(pool)
+	objectivePriorities, err := loadObjectivesFile(opts.ObjectivesFile, ds)
+	if err != nil {
+		setupLog.Error(err, "Failed to load objectives file", "path", opts.ObjectivesFile)
+		return err
+	}
 
 	// On bare metal / Slurm / Ray (or any deployment without the K8s Downward
 	// API), neither --pool-namespace nor the NAMESPACE env var is set, so the
@@ -1213,7 +1218,7 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 	// Surface this once at startup so operators porting a K8s config see why
 	// related behavior differs.
 	//
-	// Note on InferenceObjective: with no objective CRDs to consult, per-request
+	// Note on InferenceObjective: without --objectives-file, per-request
 	// priority falls back to Director.defaultPriority (see
 	// pkg/epp/requestcontrol/director.go). Static priority bands configured in
 	// EndpointPickerConfig.flowControl are honored and applied via the FlowControl
@@ -1256,9 +1261,12 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 	// EndpointPickerConfig.flowControl still apply.
 	endpointCandidates := contracts.EndpointCandidates(requestcontrol.NewDatastoreEndpointCandidates(ds,
 		requestcontrol.WithDisableEndpointSubsetFilter(opts.DisableEndpointSubsetFilter)))
-	// File-discovery mode has no InferenceObjective reconciler to drive the
-	// control plane; static bands from config apply at registry construction.
-	endpointCandidates, admissionController, _, requestEvictor := r.initAdmissionControl(r.servingCtx, opts, eppConfig, endpointCandidates)
+	// Static bands from config apply at registry construction; --objectives-file
+	// priorities are submitted here, as the InferenceObjective reconciler does.
+	endpointCandidates, admissionController, bandControlPlane, requestEvictor := r.initAdmissionControl(r.servingCtx, opts, eppConfig, endpointCandidates)
+	if bandControlPlane != nil && len(objectivePriorities) > 0 {
+		bandControlPlane.SubmitDesiredPriorities(objectivePriorities)
+	}
 	director := requestcontrol.NewDirectorWithConfig(ds, scheduler, admissionController, endpointCandidates, r.requestControlConfig)
 	if requestEvictor != nil {
 		director.SetRequestEvictor(requestEvictor)
