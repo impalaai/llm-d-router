@@ -31,6 +31,8 @@ Supports two algorithms, selected by the `strategy` parameter:
 | `sources` | list | one `header` source `x-session-id` | Where the session identifier is read from, in priority order; the first non-empty match wins. Each source sets exactly one of `header` (a request header name) or `attribute` (a request-attribute key published by an upstream plugin). |
 | `evictionTtlSeconds` | float | `300` | How long a session binding survives unused. |
 | `evictionSweepSeconds` | float | `10` | How often expired bindings are swept. |
+| `syncCrossReplicaState` | bool | `true` | Share session bindings with other EPP replicas when a cross-replica syncer is configured; see [Multiple EPP replicas](#multiple-epp-replicas). |
+| `maxSharedSessionsPerEndpoint` | int | `10000` | How many of the sessions bound to one endpoint each replica shares, keeping the most recently used. Sessions beyond it keep their local binding but are not shared. |
 
 ### Default Configuration (without PD disaggregation)
 
@@ -85,6 +87,14 @@ To support session affinity with PD disaggregation, configure two separate insta
 ```
 
 The decode instance uses the default behavior (writing the decode pod to `x-session-token`). The prefill instance uses `profileName: prefill` to look up the prefill pod from the scheduling results and write it to `x-session-token-prefill`. This ensures that subsequent requests in the same session target both the same prefill pod and the same decode pod. `session_id` supports the same pattern: configure one instance per profile, each with its own `profileName`.
+
+## Multiple EPP replicas
+
+When a cross-replica syncer is configured (`dataLayer.crossReplica`, for example `redis-syncer`) and `syncCrossReplicaState` is `true`, `session_id` bindings are shared between EPP replicas. Each replica publishes, per endpoint, the 64-bit xxhash of every session identifier bound to that endpoint and the time the binding was last used. Session identifiers themselves are not published. For each request, the scorer takes the most recently used binding among its own and those published by other replicas for the candidate pods, and adopts it as its own binding. A session keeps its pod when consecutive requests reach different replicas, and a restarted replica restores the bindings the stopped replica published for as long as the syncer retains them (`stateTTL` for `redis-syncer`). Bindings unused for longer than `evictionTtlSeconds` are ignored.
+
+Sharing is eventually consistent. Two replicas can bind a new session to different pods before either receives the other's update; once both have it, both use the more recently used binding.
+
+`redis-syncer` applies one `stateTTL` to all shared state, so a `stateTTL` long enough to carry bindings across a restart also retains a stopped replica's in-flight load for that long.
 
 ## Relationship to the session affinity filter
 

@@ -124,6 +124,11 @@ func (p *crossReplicaPublisher) run(ctx context.Context) {
 }
 
 func (p *crossReplicaPublisher) publishAll(ctx context.Context) {
+	for _, c := range p.contributors {
+		if preparer, ok := c.(fwkdl.CrossReplicaPreparer); ok {
+			preparer.PrepareCrossReplicaState()
+		}
+	}
 	snapshot := p.endpointSnapshot()
 	// A cycle with no registered endpoints makes no syncer calls; timing it
 	// would add a sub-microsecond sample every interval and skew the quantiles.

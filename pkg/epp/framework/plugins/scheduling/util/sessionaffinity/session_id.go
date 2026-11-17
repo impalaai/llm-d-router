@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -49,6 +50,14 @@ type SessionIDConfig struct {
 	EvictionTTLSeconds float64 `json:"evictionTtlSeconds"`
 	// EvictionSweepSeconds is how often expired bindings are swept.
 	EvictionSweepSeconds float64 `json:"evictionSweepSeconds"`
+	// SyncCrossReplicaState controls whether session bindings are shared
+	// across EPP replicas when a cross-replica syncer is configured. Unset
+	// defaults to true; set false to keep bindings local to this replica.
+	SyncCrossReplicaState *bool `json:"syncCrossReplicaState,omitempty"`
+	// MaxSharedSessionsPerEndpoint caps how many of the sessions bound to one
+	// endpoint each replica shares, keeping the most recently used. <= 0
+	// defaults to defaultMaxSharedSessionsPerEndpoint.
+	MaxSharedSessionsPerEndpoint int `json:"maxSharedSessionsPerEndpoint,omitempty"`
 }
 
 // SessionIDSource names one place a session identifier can be read from.
@@ -133,16 +142,32 @@ func (s SessionIDSource) validate() error {
 type SessionIDHeader struct {
 	sources     []SessionIDSource
 	profileName string
+	// typedName is the owning scorer/filter's identity. This strategy registers
+	// under it as a cross-replica contributor, and its name namespaces the
+	// shared bindings.
+	typedName plugin.TypedName
 	// pluginKey keys the Choose->PreRequest presence handoff and labels the
-	// plugin in logs; the owning scorer/filter passes its own plugin type.
+	// plugin in logs; it is the owning scorer/filter's plugin type.
 	pluginKey     plugin.StateKey
 	ttl           time.Duration
 	sweepInterval time.Duration
-	// mu serializes each bind/migrate/evict sequence so a first-bind cannot race
-	// a concurrent sweep and leave the binding store inconsistent.
+	// mu serializes each bind/migrate/adopt/evict sequence so a first-bind
+	// cannot race a concurrent sweep and leave the binding store inconsistent.
 	mu          sync.Mutex
 	bindings    sync.Map // session identifier -> binding
 	pluginState *plugin.PluginState
+	handle      plugin.Handle
+
+	syncCrossReplicaState bool
+	maxSharedSessions     int
+	// syncActive is set once RegisterDependencies registers this strategy as
+	// a cross-replica contributor.
+	syncActive  atomic.Bool
+	bindingsKey plugin.DataKey
+	// sharedViews holds, per endpoint ID, the sessions bound to that endpoint
+	// as sessionHash -> lastSeen in Unix nanoseconds, as last built by
+	// PrepareCrossReplicaState. Built maps are never written.
+	sharedViews atomic.Pointer[map[string]map[uint64]int64]
 }
 
 // Consumes declares the request attributes the configured sources read. They
@@ -171,6 +196,17 @@ func SourcesConsumes(sources []SessionIDSource) plugin.DataDependencies {
 	return plugin.DataDependencies{Optional: optional}
 }
 
+// Produces declares the endpoint attribute carrying the bindings shared across
+// EPP replicas while this strategy is a cross-replica contributor; the
+// cross-replica publisher installs it. RegisterDependencies runs before the
+// runner validates these declarations and derives the runtime scope from them.
+func (s *SessionIDHeader) Produces() map[plugin.DataKey]any {
+	if !s.syncActive.Load() {
+		return nil
+	}
+	return map[plugin.DataKey]any{s.bindingsKey: sessionBindings{}}
+}
+
 // boundPodPresence records, for one request, which pod the session was bound
 // to and whether it was present in the candidate set scored. PreRequest reads
 // this so it can tell a genuine absence from the picker merely choosing a
@@ -185,19 +221,38 @@ func (b *boundPodPresence) Clone() plugin.StateData {
 }
 
 // NewSessionIDHeader builds the shared session_id strategy implementation and
-// starts its eviction sweep for the plugin's lifetime. pluginKey is the owning
-// plugin's type, used for the PluginState handoff key and log labels.
-func NewSessionIDHeader(config SessionIDConfig, profileName string, pluginKey plugin.StateKey, handle plugin.Handle) *SessionIDHeader {
+// starts its eviction sweep for the plugin's lifetime. typedName is the owning
+// plugin's identity.
+func NewSessionIDHeader(config SessionIDConfig, profileName string, typedName plugin.TypedName, handle plugin.Handle) *SessionIDHeader {
+	syncCrossReplicaState := true
+	if config.SyncCrossReplicaState != nil {
+		syncCrossReplicaState = *config.SyncCrossReplicaState
+	}
+	maxSharedSessions := config.MaxSharedSessionsPerEndpoint
+	if maxSharedSessions <= 0 {
+		maxSharedSessions = defaultMaxSharedSessionsPerEndpoint
+	}
 	s := &SessionIDHeader{
-		sources:       config.Sources,
-		profileName:   profileName,
-		pluginKey:     pluginKey,
-		ttl:           time.Duration(config.EvictionTTLSeconds * float64(time.Second)),
-		sweepInterval: time.Duration(config.EvictionSweepSeconds * float64(time.Second)),
-		pluginState:   plugin.NewPluginState(handle.Context()),
+		sources:               config.Sources,
+		profileName:           profileName,
+		typedName:             typedName,
+		pluginKey:             plugin.StateKey(typedName.Type),
+		ttl:                   time.Duration(config.EvictionTTLSeconds * float64(time.Second)),
+		sweepInterval:         time.Duration(config.EvictionSweepSeconds * float64(time.Second)),
+		pluginState:           plugin.NewPluginState(handle.Context()),
+		handle:                handle,
+		syncCrossReplicaState: syncCrossReplicaState,
+		maxSharedSessions:     maxSharedSessions,
+		bindingsKey:           plugin.NewDataKey(sessionBindingsDataType, typedName.Type).WithNonEmptyProducerName(typedName.Name),
 	}
 	go s.runEviction(handle.Context(), s.sweepInterval)
 	return s
+}
+
+// TypedName returns the owning plugin's identity, under which this strategy
+// registers as an endpoint extractor.
+func (s *SessionIDHeader) TypedName() plugin.TypedName {
+	return s.typedName
 }
 
 // binding is the pod a session is pinned to, and when that pin was last used.
@@ -264,7 +319,8 @@ func attributeString(ctx context.Context, request *scheduling.InferenceRequest, 
 // session identifier, the session is unbound, or its bound pod is absent from
 // the candidate set: in each case the session expresses no usable preference
 // and the consumer decides. It returns (pod, true) only for a session bound to
-// a present candidate. Choose does not mutate the store; the binding is
+// a present candidate. A cross-replica contributor first adopts a newer binding
+// published for a candidate by a peer replica; the request's own binding is
 // committed in PreRequest.
 func (s *SessionIDHeader) Choose(ctx context.Context, request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) (scheduling.Endpoint, bool) {
 	if len(endpoints) == 0 {
@@ -274,6 +330,10 @@ func (s *SessionIDHeader) Choose(ctx context.Context, request *scheduling.Infere
 	sessionID := s.resolveSessionID(ctx, request)
 	if sessionID == "" {
 		return nil, false
+	}
+
+	if s.syncActive.Load() {
+		s.adoptNewestBinding(ctx, sessionID, endpoints)
 	}
 
 	podName := s.boundPod(sessionID)
@@ -311,7 +371,7 @@ func (s *SessionIDHeader) boundPod(sessionID string) string {
 	return b.podName
 }
 
-// PreRequest is the only place bindings are mutated. A session migrates only
+// PreRequest commits the binding of a routed request. A session migrates only
 // when its bound pod is absent from the candidate set.
 func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
 	sessionID := s.resolveSessionID(ctx, request)

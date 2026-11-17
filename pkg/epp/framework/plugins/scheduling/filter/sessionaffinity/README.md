@@ -33,6 +33,8 @@ Supports two algorithms, selected by the `strategy` parameter:
 | `sources` | list | one `header` source `x-session-id` | Where the session identifier is read from, in priority order; the first non-empty match wins. Each source sets exactly one of `header` (a request header name) or `attribute` (a request-attribute key published by an upstream plugin). |
 | `evictionTtlSeconds` | float | `300` | How long a session binding survives unused. |
 | `evictionSweepSeconds` | float | `10` | How often expired bindings are swept. |
+| `syncCrossReplicaState` | bool | `true` | Share session bindings with other EPP replicas when a cross-replica syncer is configured; see [Multiple EPP replicas](#multiple-epp-replicas). |
+| `maxSharedSessionsPerEndpoint` | int | `10000` | How many of the sessions bound to one endpoint each replica shares, keeping the most recently used. Sessions beyond it keep their local binding but are not shared. |
 
 ### Default Configuration (without PD disaggregation)
 
@@ -87,6 +89,10 @@ To support session affinity with PD disaggregation, configure two separate insta
 ```
 
 The decode instance uses the default behavior (writing the decode pod to `x-session-token`). The prefill instance uses `profileName: prefill` to look up the prefill pod from the scheduling results and write it to `x-session-token-prefill`. This ensures that subsequent requests in the same session target both the same prefill pod and the same decode pod. `session_id` supports the same pattern: configure one instance per profile, each with its own `profileName`.
+
+## Multiple EPP replicas
+
+`session_id` bindings are shared between EPP replicas the same way as for the scorer; see [Multiple EPP replicas](../../scorer/sessionaffinity/README.md#multiple-epp-replicas).
 
 ## Relationship to the session affinity scorer
 

@@ -82,6 +82,8 @@ func (p *parameters) validate() error {
 var _ scheduling.Scorer = &SessionAffinity{}
 var _ fwkrh.ResponseHeaderProcessor = &SessionAffinity{}
 var _ fwkrh.PreRequest = &SessionAffinity{}
+var _ datalayer.Registrant = &SessionAffinity{}
+var _ plugin.ProducerPlugin = &SessionAffinity{}
 
 func Factory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
 	params := defaultParameters()
@@ -98,9 +100,10 @@ func Factory(name string, rawParameters *json.Decoder, handle plugin.Handle) (pl
 		return nil, fmt.Errorf("invalid profileName of the '%s' scorer - %w", SessionAffinityType, err)
 	}
 
+	typedName := plugin.TypedName{Type: SessionAffinityType, Name: name}
 	return &SessionAffinity{
-		typedName: plugin.TypedName{Type: SessionAffinityType, Name: name},
-		strategy:  newStrategy(params, handle),
+		typedName: typedName,
+		strategy:  newStrategy(typedName, params, handle),
 	}, nil
 }
 
@@ -128,9 +131,9 @@ type strategy interface {
 	responseHeader(ctx context.Context, request *scheduling.InferenceRequest, response *fwkrh.Response, targetPod *datalayer.EndpointMetadata)
 }
 
-func newStrategy(params parameters, handle plugin.Handle) strategy {
+func newStrategy(typedName plugin.TypedName, params parameters, handle plugin.Handle) strategy {
 	if params.Strategy == StrategySessionID {
-		return newSessionIDHeaderStrategy(params, handle)
+		return newSessionIDHeaderStrategy(typedName, params, handle)
 	}
 	return newEncodedEndpointHeaderStrategy(params)
 }
@@ -149,6 +152,23 @@ func (s *SessionAffinity) TypedName() plugin.TypedName {
 // Consumes reports the request attributes the configured strategy reads.
 func (s *SessionAffinity) Consumes() plugin.DataDependencies {
 	return s.strategy.Consumes()
+}
+
+// Produces reports the endpoint attributes the configured strategy declares.
+func (s *SessionAffinity) Produces() map[plugin.DataKey]any {
+	if producer, ok := s.strategy.(plugin.ProducerPlugin); ok {
+		return producer.Produces()
+	}
+	return nil
+}
+
+// RegisterDependencies registers the datalayer dependencies of the configured
+// strategy, if it has any.
+func (s *SessionAffinity) RegisterDependencies(r datalayer.Registrar) error {
+	if registrant, ok := s.strategy.(datalayer.Registrant); ok {
+		return registrant.RegisterDependencies(r)
+	}
+	return nil
 }
 
 func (s *SessionAffinity) Category() scheduling.ScorerCategory {

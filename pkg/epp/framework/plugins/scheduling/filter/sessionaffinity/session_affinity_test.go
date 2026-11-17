@@ -23,10 +23,12 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
@@ -348,6 +350,73 @@ func TestSessionAffinity_FactoryValidation(t *testing.T) {
 			}
 			if p == nil {
 				t.Fatal("expected a plugin instance")
+			}
+		})
+	}
+}
+
+// stubSyncer marks a cross-replica syncer as configured on a test handle.
+type stubSyncer struct{}
+
+func (stubSyncer) TypedName() plugin.TypedName {
+	return plugin.TypedName{Type: "stub-syncer", Name: "stub"}
+}
+
+// recordingRegistrar captures the datalayer registrations a plugin declares.
+type recordingRegistrar struct {
+	registrations []fwkdl.PendingRegistration
+}
+
+func (r *recordingRegistrar) Register(reg fwkdl.PendingRegistration) error {
+	r.registrations = append(r.registrations, reg)
+	return nil
+}
+
+// TestSessionAffinity_RegisterDependencies checks that the session_id strategy
+// registers as a cross-replica contributor under the plugin's typed name and
+// declares the shared attribute so the data dependency checks accept it, and
+// that the other configurations register and declare nothing.
+func TestSessionAffinity_RegisterDependencies(t *testing.T) {
+	tests := []struct {
+		name       string
+		params     string
+		wantOwners []plugin.TypedName
+	}{
+		{
+			name:       "session_id",
+			params:     `{"strategy":"session_id"}`,
+			wantOwners: []plugin.TypedName{{Type: sessionaffinity.SessionAffinityType, Name: "test"}},
+		},
+		{name: "session_id with sync disabled", params: `{"strategy":"session_id","sessionIdConfig":{"syncCrossReplicaState":false}}`},
+		{name: "encoded_endpoint_header", params: `{"strategy":"encoded_endpoint_header"}`},
+	}
+
+	handle := utils.NewTestHandle(utils.NewTestContext(t))
+	handle.SetCrossReplicaSyncer(stubSyncer{})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			p, err := sessionaffinity.Factory("test", plugin.StrictDecoder(json.RawMessage(test.params)), handle)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			registrar := &recordingRegistrar{}
+			if err := p.(fwkdl.Registrant).RegisterDependencies(registrar); err != nil {
+				t.Fatalf("RegisterDependencies: %v", err)
+			}
+			owners := make([]plugin.TypedName, 0, len(registrar.registrations))
+			for _, reg := range registrar.registrations {
+				owners = append(owners, reg.Owner)
+			}
+			if diff := cmp.Diff(test.wantOwners, owners, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("registration owners mismatch (-want +got):\n%s", diff)
+			}
+
+			produced := p.(plugin.ProducerPlugin).Produces()
+			if len(produced) != len(test.wantOwners) {
+				t.Errorf("Produces() = %v, want %d keys", produced, len(test.wantOwners))
+			}
+			if _, err := datalayer.ValidateAndOrderDataDependencies([]plugin.Plugin{p}); err != nil {
+				t.Errorf("ValidateAndOrderDataDependencies: %v", err)
 			}
 		})
 	}

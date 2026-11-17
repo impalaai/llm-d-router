@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -163,6 +164,55 @@ func TestCrossReplicaPublisher_NonBatchPublishesEachEndpoint(t *testing.T) {
 			}
 		}
 		require.ElementsMatch(t, []string{"ns/ep-a", "ns/ep-b"}, ids)
+	}
+}
+
+// preparingContributor records its PrepareCrossReplicaState and Read calls in
+// order.
+type preparingContributor struct {
+	fakeContributor
+	mu    sync.Mutex
+	calls []string
+}
+
+func (c *preparingContributor) PrepareCrossReplicaState() { c.record("prepare") }
+
+func (c *preparingContributor) CrossReplicaState() fwkdl.CrossReplicaSpec {
+	spec := c.fakeContributor.CrossReplicaState()
+	spec.Read = func(id string) fwkdl.Cloneable {
+		c.record("read " + id)
+		return fakeCloneable{id: id}
+	}
+	return spec
+}
+
+func (c *preparingContributor) record(call string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, call)
+}
+
+func TestCrossReplicaPublisher_PreparesContributorsBeforeEachCycle(t *testing.T) {
+	syncers := map[string]fwkdl.CrossReplicaSyncer{
+		"non-batch": &fakeSyncer{},
+		"batch": &batchSyncer{onBatch: func(_ context.Context, spec fwkdl.CrossReplicaSpec, ids []string, _ time.Duration) map[string]error {
+			for _, id := range ids {
+				spec.Read(id)
+			}
+			return nil
+		}},
+	}
+	for name, syncer := range syncers {
+		t.Run(name, func(t *testing.T) {
+			contributor := &preparingContributor{fakeContributor: fakeContributor{key: "prepared:test"}}
+			pub := testCrossReplicaPublisher(syncer, contributor)
+			require.True(t, pub.registerEndpoint(testEndpoint("ep-a").GetMetadata().GetID()))
+
+			pub.publishAll(context.Background())
+			pub.publishAll(context.Background())
+
+			require.Equal(t, []string{"prepare", "read ns/ep-a", "prepare", "read ns/ep-a"}, contributor.calls)
+		})
 	}
 }
 
