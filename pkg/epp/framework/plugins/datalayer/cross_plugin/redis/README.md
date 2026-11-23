@@ -36,7 +36,19 @@ Parameters:
   Trailing carriage returns and newlines are removed.
   `passwordEnv` and `passwordFile` are mutually exclusive. Plaintext
   `password` configuration is rejected.
-- `db`: Redis database number. Defaults to `0`.
+- `db`: Redis database number. Defaults to `0`. Must be `0` when `cluster` is
+  `true`.
+- `cluster`: Set to `true` for a Redis Cluster, such as an ElastiCache
+  replication group with cluster mode enabled. `address` is then one seed node
+  or the configuration endpoint; the client discovers the other nodes and
+  follows slot redirections. Defaults to `false`.
+- `tls`: Present to connect over TLS 1.2 or newer, for example `tls: {}`. It
+  applies to every node in cluster mode. Optional fields:
+  - `caFile`: Path to a PEM bundle of CA certificates to trust instead of the
+    system roots.
+  - `serverName`: Name to verify in every server certificate instead of the
+    host it was dialed by. Set it when the server certificate does not name the
+    addresses the client dials, for example cluster nodes reached by IP.
 - `stateTTL`: Expiration for each replica's endpoint state in Redis. Defaults to
   `2s` and must be at least `1ms`.
 - `coordinationTTL`: Expiration for request-level coordination values. Defaults
@@ -78,12 +90,13 @@ The `v1alpha1` field names are listed in the
 
 ### Redis requirements
 
-TLS and Redis ACL usernames are not supported. Connections use unencrypted TCP.
-Optional password authentication uses the default Redis user. Managed Redis
-services that require TLS or an ACL username cannot use this plugin.
+Redis ACL usernames are not supported. Optional password authentication uses
+the default Redis user. Managed Redis services that require an ACL username
+cannot use this plugin.
 
-The configured Redis server must support field expiration and `SET NX GET`.
-Redis 7.4 or newer is required.
+Endpoint publication (`Set`) uses field expiration (`HPEXPIRE`) and requires
+Redis 7.4 or newer. `GetOrSet` uses `SET NX GET` and requires Redis 7.0 or
+newer.
 
 Values stored under the same state key must use a compatible `encoding/gob`
 schema. Each EPP decodes peer values into the type supplied by its local

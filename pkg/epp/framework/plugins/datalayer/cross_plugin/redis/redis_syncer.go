@@ -18,6 +18,8 @@ package redis
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,13 +52,23 @@ var _ fwkdl.CrossReplicaSyncer = (*RedisSyncer)(nil)
 var _ fwkdl.CrossReplicaBatchSyncer = (*RedisSyncer)(nil)
 
 type redisConfig struct {
-	Address         string `json:"address"`
-	Password        string `json:"password"`
-	PasswordEnv     string `json:"passwordEnv"`
-	PasswordFile    string `json:"passwordFile"`
-	DB              int    `json:"db"`
-	StateTTL        string `json:"stateTTL"`
-	CoordinationTTL string `json:"coordinationTTL"`
+	Address         string     `json:"address"`
+	Password        string     `json:"password"`
+	PasswordEnv     string     `json:"passwordEnv"`
+	PasswordFile    string     `json:"passwordFile"`
+	DB              int        `json:"db"`
+	StateTTL        string     `json:"stateTTL"`
+	CoordinationTTL string     `json:"coordinationTTL"`
+	TLS             *tlsConfig `json:"tls"`
+	Cluster         bool       `json:"cluster"`
+}
+
+// tlsConfig turns on TLS when present, even when empty.
+type tlsConfig struct {
+	// CAFile is a PEM bundle that replaces the system roots.
+	CAFile string `json:"caFile"`
+	// ServerName overrides the name verified in every server certificate.
+	ServerName string `json:"serverName"`
 }
 
 // RedisSyncer is a CrossReplicaSyncer backed by Redis for cross-replica
@@ -66,7 +78,7 @@ type redisConfig struct {
 type RedisSyncer struct {
 	typedName       fwkplugin.TypedName
 	replicaID       string
-	client          *goredis.Client
+	client          goredis.UniversalClient
 	stateTTL        time.Duration
 	coordinationTTL time.Duration
 	cache           sync.Map
@@ -114,6 +126,26 @@ func resolvePassword(cfg redisConfig) (string, error) {
 	return "", nil
 }
 
+// buildTLSConfig returns nil when cfg is nil, so the connection stays plain TCP.
+func buildTLSConfig(cfg *tlsConfig) (*tls.Config, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: cfg.ServerName}
+	if cfg.CAFile != "" {
+		pem, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("redis-syncer: read tls caFile %q: %w", cfg.CAFile, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("redis-syncer: tls caFile %q contains no certificates", cfg.CAFile)
+		}
+		tlsCfg.RootCAs = pool
+	}
+	return tlsCfg, nil
+}
+
 func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	var cfg redisConfig
 	if params != nil {
@@ -124,6 +156,9 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 	}
 	if cfg.Address == "" {
 		cfg.Address = defaultAddress
+	}
+	if cfg.Cluster && cfg.DB != 0 {
+		return nil, fmt.Errorf("redis-syncer: db must be 0 in cluster mode, got %d", cfg.DB)
 	}
 
 	stateTTL, err := parseTTL("stateTTL", cfg.StateTTL, crossreplica.DefaultStateTTL)
@@ -138,18 +173,33 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 	if err != nil {
 		return nil, err
 	}
+	tlsCfg, err := buildTLSConfig(cfg.TLS)
+	if err != nil {
+		return nil, err
+	}
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "unknown"
 	}
 	replicaID := hostname + "-" + uuid.NewString()
 
-	client := goredis.NewClient(&goredis.Options{
-		Addr:                  cfg.Address,
-		Password:              password,
-		DB:                    cfg.DB,
-		ContextTimeoutEnabled: true,
-	})
+	var client goredis.UniversalClient
+	if cfg.Cluster {
+		client = goredis.NewClusterClient(&goredis.ClusterOptions{
+			Addrs:                 []string{cfg.Address},
+			Password:              password,
+			TLSConfig:             tlsCfg,
+			ContextTimeoutEnabled: true,
+		})
+	} else {
+		client = goredis.NewClient(&goredis.Options{
+			Addr:                  cfg.Address,
+			Password:              password,
+			DB:                    cfg.DB,
+			TLSConfig:             tlsCfg,
+			ContextTimeoutEnabled: true,
+		})
+	}
 	if handle != nil && handle.Context() != nil {
 		context.AfterFunc(handle.Context(), func() { _ = client.Close() })
 	}
