@@ -68,8 +68,12 @@ func TestIntegrationClusterTLS(t *testing.T) {
 			_, _, err := syncer.LoadOrStore(t.Context(), "spread", strconv.Itoa(i), "e1", time.Minute)
 			require.NoError(t, err)
 		}
+		counts := keysPerMaster(t, cluster, prefix+":kv:spread:*")
+		if len(counts) < 2 {
+			t.Skipf("the cluster has %d master", len(counts))
+		}
 		shardsWithKeys := 0
-		for _, n := range keysPerMaster(t, cluster, prefix+":kv:spread:*") {
+		for _, n := range counts {
 			if n > 0 {
 				shardsWithKeys++
 			}
