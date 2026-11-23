@@ -61,6 +61,7 @@ type redisConfig struct {
 	CoordinationTTL string     `json:"coordinationTTL"`
 	TLS             *tlsConfig `json:"tls"`
 	Cluster         bool       `json:"cluster"`
+	KeyPrefix       string     `json:"keyPrefix"`
 }
 
 // tlsConfig turns on TLS when present, even when empty.
@@ -79,6 +80,7 @@ type RedisSyncer struct {
 	typedName       fwkplugin.TypedName
 	replicaID       string
 	client          goredis.UniversalClient
+	keyPrefix       string
 	stateTTL        time.Duration
 	coordinationTTL time.Duration
 	cache           sync.Map
@@ -208,6 +210,7 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 		typedName:       fwkplugin.TypedName{Type: RedisSyncerType, Name: name},
 		replicaID:       replicaID,
 		client:          client,
+		keyPrefix:       cfg.KeyPrefix,
 		stateTTL:        stateTTL,
 		coordinationTTL: coordinationTTL,
 	}, nil
@@ -217,13 +220,23 @@ func (s *RedisSyncer) TypedName() fwkplugin.TypedName {
 	return s.typedName
 }
 
+// key joins parts with ":" under the configured key prefix, so every key the
+// syncer touches lives in the prefix's namespace.
+func (s *RedisSyncer) key(parts ...string) string {
+	key := strings.Join(parts, ":")
+	if s.keyPrefix == "" {
+		return key
+	}
+	return s.keyPrefix + ":" + key
+}
+
 func (s *RedisSyncer) hashKey(key fwkdl.StateKey, endpointID string) string {
-	return string(key) + ":" + endpointID
+	return s.key(string(key), endpointID)
 }
 
 // coordKey namespaces request-level values away from endpoint hashes.
 func (s *RedisSyncer) coordKey(key fwkdl.StateKey, id string) string {
-	return "coord:" + string(key) + ":" + id
+	return s.key("coord", string(key), id)
 }
 
 // set publishes this replica's value and prepares the peer aggregate returned

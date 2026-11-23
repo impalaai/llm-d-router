@@ -49,6 +49,12 @@ Parameters:
   - `serverName`: Name to verify in every server certificate instead of the
     host it was dialed by. Set it when the server certificate does not name the
     addresses the client dials, for example cluster nodes reached by IP.
+- `keyPrefix`: Optional namespace prepended, followed by `:`, to every key the
+  plugin writes. Use it to keep the keys of different EPP pools apart when they
+  share one Redis, for example `llmd:poolA` and `llmd:poolB`. EPPs that must
+  share state, such as the old and new deployments during a rollout, must use
+  the same prefix. Leave out `{` and `}`: in cluster mode they make the prefix a
+  hash tag, which puts every key on one shard. Defaults to no prefix.
 - `stateTTL`: Expiration for each replica's endpoint state in Redis. Defaults to
   `2s` and must be at least `1ms`.
 - `coordinationTTL`: Expiration for request-level coordination values. Defaults
@@ -103,6 +109,8 @@ schema. Each EPP decodes peer values into the type supplied by its local
 contributor without requiring global `gob.Register` calls.
 
 ## State Model
+
+Every key below is preceded by `<keyPrefix>:` when `keyPrefix` is set.
 
 Endpoint state is stored in one Redis hash per state key and endpoint. Each EPP
 owns one field in that hash, identified by its hostname and a process-specific
