@@ -90,6 +90,27 @@ type CrossReplicaBatchSyncer interface {
 	SetBatch(ctx context.Context, spec CrossReplicaSpec, endpointIDs []string, timeout time.Duration) map[string]error
 }
 
+// CrossReplicaValueStore is an optional interface for a CrossReplicaSyncer
+// that stores request-level string values with caller-chosen expirations.
+// Each method is one atomic operation on one key and is linearizable across
+// every EPP replica sharing the syncer. ttl must be at least 1ms. Callers
+// bound each call with ctx.
+type CrossReplicaValueStore interface {
+	// LoadAndRefresh returns the value stored for key and id and resets its
+	// expiration to ttl. found is false when no value is stored.
+	LoadAndRefresh(ctx context.Context, key StateKey, id string, ttl time.Duration) (value string, found bool, err error)
+
+	// LoadOrStore stores value with expiration ttl unless a value is stored,
+	// and returns the value stored afterwards. loaded is true when that value
+	// was already stored, for example by another replica.
+	LoadOrStore(ctx context.Context, key StateKey, id, value string, ttl time.Duration) (actual string, loaded bool, err error)
+
+	// CompareAndSwap stores value with expiration ttl when the stored value
+	// equals old or no value is stored, and returns the value stored
+	// afterwards. swapped reports whether value was stored.
+	CompareAndSwap(ctx context.Context, key StateKey, id, old, value string, ttl time.Duration) (actual string, swapped bool, err error)
+}
+
 // CrossReplicaContributor is an opt-in interface for endpoint extractors that
 // want their installed attributes to reflect cross-replica aggregate state.
 // The plugin's Extract method is unchanged; the runtime detects this interface

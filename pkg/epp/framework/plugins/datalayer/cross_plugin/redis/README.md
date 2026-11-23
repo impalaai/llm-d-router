@@ -124,6 +124,25 @@ local value. If no peer value is available, `Get` returns the local value.
 Request-level coordination uses separate string keys and `SET NX GET` so the
 first value stored for a request is selected atomically across EPP replicas.
 
+## Value Store
+
+The plugin also implements the optional `CrossReplicaValueStore` interface:
+string values that every EPP replica reads and writes atomically, one key per
+value, each with an expiration the caller chooses. Plugins that keep a small
+amount of shared state per request key, such as a session-to-endpoint binding,
+use it instead of publishing whole tables every `syncInterval`.
+
+| Method | Redis command | Minimum Redis | Result |
+|---|---|---|---|
+| `LoadAndRefresh` | `GETEX key PX ttl` | 6.2 | The stored value, with its expiration reset to `ttl`. |
+| `LoadOrStore` | `SET key value NX GET PX ttl` | 7.0 | The value stored afterwards: the caller's, or the one another replica stored first. |
+| `CompareAndSwap` | Lua script (`EVALSHA`, then `EVAL`) | 7.0 | Stores the new value when the key holds `old` or nothing, and returns the value stored afterwards. |
+
+Keys are `<keyPrefix>:kv:<stateKey>:<id>`. Each call touches one key, so in
+cluster mode the keys spread across shards. `ttl` must be at least `1ms`.
+Every call is bounded by its caller's context and returns Redis errors as is;
+the caller decides how to fall back.
+
 ## Scheduling and Admission
 
 Periodic endpoint synchronization provides peer-aware scheduling state. It is
