@@ -161,9 +161,10 @@ Core settings for the Endpoint Picker Proxy (EPP) container and pod, including s
 Choose this option when EPP throughput needs to scale across replicas and routing
 uses in-flight load. Provision **Redis 7.4 or newer separately** and create any
 password Secret in the release namespace. The chart does not deploy Redis;
-whether to offer an optional Redis subchart is an open question. The syncer uses
-unencrypted TCP and optional password authentication for the default Redis user;
-Redis services requiring TLS or an ACL username are unsupported.
+whether to offer an optional Redis subchart is an open question. The chart
+configures unencrypted TCP and optional password authentication for the default
+Redis user. The plugin's `tls`, `cluster`, and `keyPrefix` parameters have no
+chart values. Redis services requiring an ACL username are unsupported.
 
 ```yaml
 router:

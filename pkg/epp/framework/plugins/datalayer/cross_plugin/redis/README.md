@@ -43,7 +43,8 @@ Parameters:
   or the configuration endpoint; the client discovers the other nodes and
   follows slot redirections. Each endpoint's state is published in its own
   transaction, one round trip per endpoint, because a cluster transaction
-  cannot span hash slots. Defaults to `false`.
+  cannot span hash slots. The endpoints of one 100-endpoint batch are published
+  in sequence and share one `publishTimeout`. Defaults to `false`.
 - `tls`: Present to connect over TLS 1.2 or newer, for example `tls: {}`. It
   applies to every node in cluster mode. Optional fields:
   - `caFile`: Path to a PEM bundle of CA certificates to trust instead of the
@@ -104,7 +105,8 @@ cannot use this plugin.
 
 Endpoint publication (`Set`) uses field expiration (`HPEXPIRE`) and requires
 Redis 7.4 or newer. `GetOrSet` uses `SET NX GET` and requires Redis 7.0 or
-newer.
+newer. On an older server, such as ElastiCache for Redis OSS 7.1, every
+endpoint publication fails; `GetOrSet` and the value store work.
 
 Values stored under the same state key must use a compatible `encoding/gob`
 schema. Each EPP decodes peer values into the type supplied by its local

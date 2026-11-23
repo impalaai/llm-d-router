@@ -95,6 +95,11 @@ type CrossReplicaBatchSyncer interface {
 // Each method is one atomic operation on one key and is linearizable across
 // every EPP replica sharing the syncer. ttl must be at least 1ms. Callers
 // bound each call with ctx.
+//
+// An implementation may retry a write whose reply was lost. The retry then
+// finds the caller's own value stored, so LoadOrStore reports loaded and
+// CompareAndSwap reports not swapped. The returned value is correct in both
+// cases, so callers act on it and treat loaded and swapped as advisory.
 type CrossReplicaValueStore interface {
 	// LoadAndRefresh returns the value stored for key and id and resets its
 	// expiration to ttl. found is false when no value is stored.
