@@ -80,9 +80,9 @@ The `approx-prefix-cache-producer` shares a capped recent window of prefix
 hashes the same way when `syncCrossReplicaState` is true (the default).
 The `session_id` strategy of `session-affinity-scorer` and
 `session-affinity-filter` shares its session bindings when
-`syncCrossReplicaState` is true (the default), so a session keeps its pod
-across replicas, and across an EPP restart while the syncer retains the
-stopped replica's state; see
+`syncCrossReplicaState` is true (the default) and the syncer stores per-key
+values, as `redis-syncer` does, so a session keeps its pod across replicas and
+across an EPP restart; see
 [Multiple EPP replicas](../pkg/epp/framework/plugins/scheduling/scorer/sessionaffinity/README.md#multiple-epp-replicas).
 Configuring a syncer does not change the scheduling profile or synchronize
 flow-control queues or fairness accounting.

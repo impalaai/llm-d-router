@@ -23,7 +23,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -51,13 +50,13 @@ type SessionIDConfig struct {
 	// EvictionSweepSeconds is how often expired bindings are swept.
 	EvictionSweepSeconds float64 `json:"evictionSweepSeconds"`
 	// SyncCrossReplicaState controls whether session bindings are shared
-	// across EPP replicas when a cross-replica syncer is configured. Unset
-	// defaults to true; set false to keep bindings local to this replica.
+	// across EPP replicas when the configured cross-replica syncer stores
+	// per-key values. Unset defaults to true; set false to keep bindings local
+	// to this replica.
 	SyncCrossReplicaState *bool `json:"syncCrossReplicaState,omitempty"`
-	// MaxSharedSessionsPerEndpoint caps how many of the sessions bound to one
-	// endpoint each replica shares, keeping the most recently used. <= 0
-	// defaults to defaultMaxSharedSessionsPerEndpoint.
-	MaxSharedSessionsPerEndpoint int `json:"maxSharedSessionsPerEndpoint,omitempty"`
+	// StoreTimeoutSeconds bounds the shared-store calls of one request in each
+	// of Choose and PreRequest. 0 defaults to defaultStoreTimeoutSeconds.
+	StoreTimeoutSeconds float64 `json:"storeTimeoutSeconds,omitempty"`
 }
 
 // SessionIDSource names one place a session identifier can be read from.
@@ -107,7 +106,13 @@ func (c *SessionIDConfig) Validate() error {
 	if err := duration.ValidateSeconds("evictionTtlSeconds", c.EvictionTTLSeconds); err != nil {
 		return err
 	}
-	return duration.ValidateSeconds("evictionSweepSeconds", c.EvictionSweepSeconds)
+	if err := duration.ValidateSeconds("evictionSweepSeconds", c.EvictionSweepSeconds); err != nil {
+		return err
+	}
+	if c.StoreTimeoutSeconds == 0 {
+		return nil
+	}
+	return duration.ValidateSeconds("storeTimeoutSeconds", c.StoreTimeoutSeconds)
 }
 
 // ValidateSources rejects a source that does not set exactly one of Header or
@@ -135,6 +140,10 @@ func (s SessionIDSource) validate() error {
 // session whose bound pod is absent rebinds to the pod the request was routed
 // to.
 //
+// With a cross-replica syncer that stores per-key values, each binding is also
+// one key in that store, read on every request. The stored binding overrides
+// the local one, and the local one answers when the store does not.
+//
 // It is the shared implementation behind the session-affinity scorer and
 // filter: Choose resolves the target endpoint, PreRequest commits the binding,
 // ResponseHeader is a no-op. Each plugin embeds it and adds only its own output
@@ -142,9 +151,8 @@ func (s SessionIDSource) validate() error {
 type SessionIDHeader struct {
 	sources     []SessionIDSource
 	profileName string
-	// typedName is the owning scorer/filter's identity. This strategy registers
-	// under it as a cross-replica contributor, and its name namespaces the
-	// shared bindings.
+	// typedName is the owning scorer/filter's identity. Its name namespaces
+	// the shared bindings.
 	typedName plugin.TypedName
 	// pluginKey keys the Choose->PreRequest presence handoff and labels the
 	// plugin in logs; it is the owning scorer/filter's plugin type.
@@ -159,15 +167,9 @@ type SessionIDHeader struct {
 	handle      plugin.Handle
 
 	syncCrossReplicaState bool
-	maxSharedSessions     int
-	// syncActive is set once RegisterDependencies registers this strategy as
-	// a cross-replica contributor.
-	syncActive  atomic.Bool
-	bindingsKey plugin.DataKey
-	// sharedViews holds, per endpoint ID, the sessions bound to that endpoint
-	// as sessionHash -> lastSeen in Unix nanoseconds, as last built by
-	// PrepareCrossReplicaState. Built maps are never written.
-	sharedViews atomic.Pointer[map[string]map[uint64]int64]
+	storeTimeout          time.Duration
+	pinStateKey           datalayer.StateKey
+	warnNoStore           sync.Once
 }
 
 // Consumes declares the request attributes the configured sources read. They
@@ -196,17 +198,6 @@ func SourcesConsumes(sources []SessionIDSource) plugin.DataDependencies {
 	return plugin.DataDependencies{Optional: optional}
 }
 
-// Produces declares the endpoint attribute carrying the bindings shared across
-// EPP replicas while this strategy is a cross-replica contributor; the
-// cross-replica publisher installs it. RegisterDependencies runs before the
-// runner validates these declarations and derives the runtime scope from them.
-func (s *SessionIDHeader) Produces() map[plugin.DataKey]any {
-	if !s.syncActive.Load() {
-		return nil
-	}
-	return map[plugin.DataKey]any{s.bindingsKey: sessionBindings{}}
-}
-
 // boundPodPresence records, for one request, which pod the session was bound
 // to and whether it was present in the candidate set scored. PreRequest reads
 // this so it can tell a genuine absence from the picker merely choosing a
@@ -214,10 +205,15 @@ func (s *SessionIDHeader) Produces() map[plugin.DataKey]any {
 type boundPodPresence struct {
 	podName string
 	present bool
+	// shared reports that Choose read the shared store, and sharedPod is the
+	// pod it held for the session, or "" when it held none.
+	shared    bool
+	sharedPod string
 }
 
 func (b *boundPodPresence) Clone() plugin.StateData {
-	return &boundPodPresence{podName: b.podName, present: b.present}
+	clone := *b
+	return &clone
 }
 
 // NewSessionIDHeader builds the shared session_id strategy implementation and
@@ -228,9 +224,9 @@ func NewSessionIDHeader(config SessionIDConfig, profileName string, typedName pl
 	if config.SyncCrossReplicaState != nil {
 		syncCrossReplicaState = *config.SyncCrossReplicaState
 	}
-	maxSharedSessions := config.MaxSharedSessionsPerEndpoint
-	if maxSharedSessions <= 0 {
-		maxSharedSessions = defaultMaxSharedSessionsPerEndpoint
+	storeTimeoutSeconds := config.StoreTimeoutSeconds
+	if storeTimeoutSeconds == 0 {
+		storeTimeoutSeconds = defaultStoreTimeoutSeconds
 	}
 	s := &SessionIDHeader{
 		sources:               config.Sources,
@@ -242,17 +238,16 @@ func NewSessionIDHeader(config SessionIDConfig, profileName string, typedName pl
 		pluginState:           plugin.NewPluginState(handle.Context()),
 		handle:                handle,
 		syncCrossReplicaState: syncCrossReplicaState,
-		maxSharedSessions:     maxSharedSessions,
-		bindingsKey:           plugin.NewDataKey(sessionBindingsDataType, typedName.Type).WithNonEmptyProducerName(typedName.Name),
+		storeTimeout:          time.Duration(storeTimeoutSeconds * float64(time.Second)),
+		pinStateKey:           datalayer.StateKey("session-affinity:" + typedName.Name),
+	}
+	if recorder := handle.Metrics(); recorder != nil {
+		if err := registerMetrics(recorder); err != nil {
+			log.FromContext(handle.Context()).Error(err, "Session affinity - shared pin metrics are not exported", "plugin", typedName.String())
+		}
 	}
 	go s.runEviction(handle.Context(), s.sweepInterval)
 	return s
-}
-
-// TypedName returns the owning plugin's identity, under which this strategy
-// registers as an endpoint extractor.
-func (s *SessionIDHeader) TypedName() plugin.TypedName {
-	return s.typedName
 }
 
 // binding is the pod a session is pinned to, and when that pin was last used.
@@ -319,9 +314,8 @@ func attributeString(ctx context.Context, request *scheduling.InferenceRequest, 
 // session identifier, the session is unbound, or its bound pod is absent from
 // the candidate set: in each case the session expresses no usable preference
 // and the consumer decides. It returns (pod, true) only for a session bound to
-// a present candidate. A cross-replica contributor first adopts a newer binding
-// published for a candidate by a peer replica; the request's own binding is
-// committed in PreRequest.
+// a present candidate. A binding held in the shared store replaces the local
+// one first; the request's own binding is committed in PreRequest.
 func (s *SessionIDHeader) Choose(ctx context.Context, request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) (scheduling.Endpoint, bool) {
 	if len(endpoints) == 0 {
 		return nil, false
@@ -332,8 +326,9 @@ func (s *SessionIDHeader) Choose(ctx context.Context, request *scheduling.Infere
 		return nil, false
 	}
 
-	if s.syncActive.Load() {
-		s.adoptNewestBinding(ctx, sessionID, endpoints)
+	sharedPod, shared := s.loadSharedPin(ctx, sessionID)
+	if sharedPod != "" {
+		s.bindLocal(sessionID, sharedPod)
 	}
 
 	podName := s.boundPod(sessionID)
@@ -344,8 +339,10 @@ func (s *SessionIDHeader) Choose(ctx context.Context, request *scheduling.Infere
 		}
 	}
 
-	if podName != "" {
-		s.pluginState.Write(request.RequestID, s.pluginKey, &boundPodPresence{podName: podName, present: target != nil})
+	if podName != "" || shared {
+		s.pluginState.Write(request.RequestID, s.pluginKey, &boundPodPresence{
+			podName: podName, present: target != nil, shared: shared, sharedPod: sharedPod,
+		})
 	}
 
 	if target == nil {
@@ -383,6 +380,17 @@ func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.In
 		return
 	}
 
+	present, err := plugin.ReadPluginStateKey[*boundPodPresence](s.pluginState, request.RequestID, s.pluginKey)
+	if err != nil {
+		present = nil
+	}
+	if present != nil && present.shared {
+		if pinned, ok := s.commitSharedPin(ctx, sessionID, podName, present); ok {
+			s.bindLocal(sessionID, pinned)
+			return
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -408,8 +416,7 @@ func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.In
 	// this request's own Choose call. A missing record (e.g. a concurrent
 	// first-bind race) is not treated as absence, and neither is a record about
 	// a pod a concurrent request has already migrated the session away from.
-	present, err := plugin.ReadPluginStateKey[*boundPodPresence](s.pluginState, request.RequestID, s.pluginKey)
-	if err != nil || present == nil || present.present || present.podName != existing.podName {
+	if present == nil || present.present || present.podName != existing.podName {
 		return
 	}
 

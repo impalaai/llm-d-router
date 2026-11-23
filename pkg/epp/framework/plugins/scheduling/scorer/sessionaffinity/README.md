@@ -31,8 +31,8 @@ Supports two algorithms, selected by the `strategy` parameter:
 | `sources` | list | one `header` source `x-session-id` | Where the session identifier is read from, in priority order; the first non-empty match wins. Each source sets exactly one of `header` (a request header name) or `attribute` (a request-attribute key published by an upstream plugin). |
 | `evictionTtlSeconds` | float | `300` | How long a session binding survives unused. |
 | `evictionSweepSeconds` | float | `10` | How often expired bindings are swept. |
-| `syncCrossReplicaState` | bool | `true` | Share session bindings with other EPP replicas when a cross-replica syncer is configured; see [Multiple EPP replicas](#multiple-epp-replicas). |
-| `maxSharedSessionsPerEndpoint` | int | `10000` | How many of the sessions bound to one endpoint each replica shares, keeping the most recently used. Sessions beyond it keep their local binding but are not shared. |
+| `syncCrossReplicaState` | bool | `true` | Share session bindings with other EPP replicas when the configured cross-replica syncer stores per-key values; see [Multiple EPP replicas](#multiple-epp-replicas). |
+| `storeTimeoutSeconds` | float | `0.05` | Time limit for the shared-store calls of one request; see [Multiple EPP replicas](#multiple-epp-replicas). |
 
 ### Default Configuration (without PD disaggregation)
 
@@ -90,11 +90,21 @@ The decode instance uses the default behavior (writing the decode pod to `x-sess
 
 ## Multiple EPP replicas
 
-When a cross-replica syncer is configured (`dataLayer.crossReplica`, for example `redis-syncer`) and `syncCrossReplicaState` is `true`, `session_id` bindings are shared between EPP replicas. Each replica publishes, per endpoint, the 64-bit xxhash of every session identifier bound to that endpoint and the time the binding was last used. Session identifiers themselves are not published. For each request, the scorer takes the most recently used binding among its own and those published by other replicas for the candidate pods, and adopts it as its own binding. A session keeps its pod when consecutive requests reach different replicas, and a restarted replica restores the bindings the stopped replica published for as long as the syncer retains them (`stateTTL` for `redis-syncer`). Bindings unused for longer than `evictionTtlSeconds` are ignored.
+`session_id` bindings are shared between EPP replicas when `syncCrossReplicaState` is `true` and the configured cross-replica syncer (`dataLayer.crossReplica`) stores per-key values. `redis-syncer` does; see its [Value Store](../../../datalayer/cross_plugin/redis/README.md#value-store). With any other syncer, or none, bindings stay local to each replica.
 
-Sharing is eventually consistent. Two replicas can bind a new session to different pods before either receives the other's update; once both have it, both use the more recently used binding.
+Each binding is one key in the store, named by the 64-bit xxhash of the session identifier and holding the endpoint ID. Session identifiers themselves are not stored. The key expires `evictionTtlSeconds` after its last use.
 
-`redis-syncer` applies one `stateTTL` to all shared state, so a `stateTTL` long enough to carry bindings across a restart also retains a stopped replica's in-flight load for that long.
+For each request that carries a session identifier:
+
+1. The plugin reads the key, which also resets its expiration. A stored binding replaces the replica's local one.
+2. A session with no stored binding is scheduled normally. After the request is routed, the replica stores the binding unless another replica stored one first, and then uses the stored one.
+3. A stored binding whose pod is not among the request's candidates is replaced with the routed pod, unless another replica replaced it first.
+
+A known session costs one store call per request and a new session two. A replica that starts with an empty local map finds existing bindings in the store.
+
+The request that creates or replaces a binding is routed before the store answers. When several replicas do this for one session at the same moment, each of those requests goes to the pod its own replica picked, and later requests all go to the stored pod.
+
+When a store call fails or takes longer than `storeTimeoutSeconds`, the replica routes on its local binding, or schedules normally when it has none. A local binding is stored again on the next request the store answers and holds no binding for.
 
 ## Relationship to the session affinity filter
 

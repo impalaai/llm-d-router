@@ -125,14 +125,6 @@ type CrossReplicaContributor interface {
 	CrossReplicaState() CrossReplicaSpec
 }
 
-// CrossReplicaPreparer is an optional interface for a CrossReplicaContributor
-// that builds its published values once per publication cycle rather than on
-// every Read. The publisher calls PrepareCrossReplicaState at the start of each
-// cycle, before it publishes any endpoint in that cycle.
-type CrossReplicaPreparer interface {
-	PrepareCrossReplicaState()
-}
-
 // CrossReplicaSpec declares what a CrossReplicaContributor publishes and where.
 type CrossReplicaSpec struct {
 	// StateKey namespaces this contributor's data in the syncer.
@@ -142,8 +134,7 @@ type CrossReplicaSpec struct {
 	// The runtime overwrites this key with a syncer-reading closure.
 	AttributeKey fwkplugin.DataKey
 
-	// Read returns the live local value for the given endpoint. For a
-	// CrossReplicaPreparer it returns the value prepared for the current cycle.
+	// Read returns the live local value for the given endpoint.
 	Read func(endpointID string) Cloneable
 
 	// Aggregate combines per-replica values into a single aggregate. Its output

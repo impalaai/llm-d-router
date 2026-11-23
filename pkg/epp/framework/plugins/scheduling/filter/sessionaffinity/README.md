@@ -33,8 +33,8 @@ Supports two algorithms, selected by the `strategy` parameter:
 | `sources` | list | one `header` source `x-session-id` | Where the session identifier is read from, in priority order; the first non-empty match wins. Each source sets exactly one of `header` (a request header name) or `attribute` (a request-attribute key published by an upstream plugin). |
 | `evictionTtlSeconds` | float | `300` | How long a session binding survives unused. |
 | `evictionSweepSeconds` | float | `10` | How often expired bindings are swept. |
-| `syncCrossReplicaState` | bool | `true` | Share session bindings with other EPP replicas when a cross-replica syncer is configured; see [Multiple EPP replicas](#multiple-epp-replicas). |
-| `maxSharedSessionsPerEndpoint` | int | `10000` | How many of the sessions bound to one endpoint each replica shares, keeping the most recently used. Sessions beyond it keep their local binding but are not shared. |
+| `syncCrossReplicaState` | bool | `true` | Share session bindings with other EPP replicas when the configured cross-replica syncer stores per-key values; see [Multiple EPP replicas](#multiple-epp-replicas). |
+| `storeTimeoutSeconds` | float | `0.05` | Time limit for the shared-store calls of one request; see [Multiple EPP replicas](#multiple-epp-replicas). |
 
 ### Default Configuration (without PD disaggregation)
 

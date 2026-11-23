@@ -84,8 +84,6 @@ func (p *parameters) validate() error {
 var _ scheduling.Filter = &SessionAffinity{}
 var _ fwkrh.ResponseHeaderProcessor = &SessionAffinity{}
 var _ fwkrh.PreRequest = &SessionAffinity{}
-var _ datalayer.Registrant = &SessionAffinity{}
-var _ plugin.ProducerPlugin = &SessionAffinity{}
 
 // Factory defines the factory function for the SessionAffinity filter.
 func Factory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
@@ -157,23 +155,6 @@ func (s *SessionAffinity) TypedName() plugin.TypedName {
 // Consumes reports the request attributes the configured strategy reads.
 func (s *SessionAffinity) Consumes() plugin.DataDependencies {
 	return s.strategy.Consumes()
-}
-
-// Produces reports the endpoint attributes the configured strategy declares.
-func (s *SessionAffinity) Produces() map[plugin.DataKey]any {
-	if producer, ok := s.strategy.(plugin.ProducerPlugin); ok {
-		return producer.Produces()
-	}
-	return nil
-}
-
-// RegisterDependencies registers the datalayer dependencies of the configured
-// strategy, if it has any.
-func (s *SessionAffinity) RegisterDependencies(r datalayer.Registrar) error {
-	if registrant, ok := s.strategy.(datalayer.Registrant); ok {
-		return registrant.RegisterDependencies(r)
-	}
-	return nil
 }
 
 // Filter returns the endpoint running the session when it is among the
