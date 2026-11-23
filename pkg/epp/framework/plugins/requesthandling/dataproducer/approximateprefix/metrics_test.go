@@ -18,6 +18,8 @@ package approximateprefix
 
 import (
 	"context"
+	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -89,7 +91,7 @@ func resetMetrics() {
 func TestPreRequestRecordsPrediction(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-predicted-records"
+	name := uniqueName("approx-predicted-records")
 	p := producerForPrediction(t, name, 2)
 	endpoints, result := endpointAndResult()
 
@@ -112,7 +114,7 @@ func TestPreRequestRecordsPrediction(t *testing.T) {
 func TestPreRequestRecordsPredictionModality(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-predicted-modality"
+	name := uniqueName("approx-predicted-modality")
 	p := producerForPrediction(t, name, 2)
 	endpoints, result := endpointAndResult()
 
@@ -165,7 +167,7 @@ func TestPreRequestRecordsPredictionModality(t *testing.T) {
 func TestPreRequestPredictionBoundedByPromptLength(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-predicted-partial-block"
+	name := uniqueName("approx-predicted-partial-block")
 	p := producerForPrediction(t, name, 4)
 	endpoints, result := endpointAndResult()
 
@@ -184,7 +186,7 @@ func TestPreRequestPredictionBoundedByPromptLength(t *testing.T) {
 func TestPreRequestPredictionBoundsEachPromptSeparately(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-predicted-multi-prompt"
+	name := uniqueName("approx-predicted-multi-prompt")
 	p := producerForPrediction(t, name, 4)
 	endpoints, result := endpointAndResult()
 
@@ -209,7 +211,7 @@ func TestPreRequestPredictionBoundsEachPromptSeparately(t *testing.T) {
 func TestPreRequestPredictionCountsUnhashedPrompts(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-predicted-no-hashes"
+	name := uniqueName("approx-predicted-no-hashes")
 	p, err := newDataProducer(context.Background(), name, config{
 		BlockSizeTokens:        4,
 		MaxPrefixTokensToMatch: 2,
@@ -231,7 +233,7 @@ func TestPreRequestPredictionCountsUnhashedPrompts(t *testing.T) {
 func TestPreRequestPredictionFollowsPrefillEndpoint(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-predicted-pd"
+	name := uniqueName("approx-predicted-pd")
 	p := producerForPrediction(t, name, 2)
 	decode := fwksched.NewEndpoint(
 		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "decode", Namespace: "default"}},
@@ -276,7 +278,7 @@ func TestPreRequestPredictionFollowsPrefillEndpoint(t *testing.T) {
 func TestPreRequestBestPredictedSpansScoredCandidates(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-best-scored"
+	name := uniqueName("approx-best-scored")
 	p := producerForPrediction(t, name, 2)
 	cold, cached := namedEndpoint("cold"), namedEndpoint("cached")
 	pods := []fwksched.Endpoint{cold, cached}
@@ -298,7 +300,7 @@ func TestPreRequestBestPredictedSpansScoredCandidates(t *testing.T) {
 func TestPreRequestBestIgnoresNonCandidateServers(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-best-non-candidate"
+	name := uniqueName("approx-best-non-candidate")
 	p := producerForPrediction(t, name, 2)
 	other, candidate := namedEndpoint("other-pool"), namedEndpoint("candidate")
 	tokens := []uint32{1, 2, 3, 4}
@@ -316,7 +318,7 @@ func TestPreRequestBestIgnoresNonCandidateServers(t *testing.T) {
 func TestPreRequestBestAvailableSpansFilteredOutCandidates(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-best-available"
+	name := uniqueName("approx-best-available")
 	p := producerForPrediction(t, name, 2)
 	survivor, dropped := namedEndpoint("survivor"), namedEndpoint("dropped")
 	pods := []fwksched.Endpoint{survivor, dropped}
@@ -338,7 +340,7 @@ func TestPreRequestBestAvailableSpansFilteredOutCandidates(t *testing.T) {
 func TestPreRequestBestFallsBackToSelected(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-best-no-scored"
+	name := uniqueName("approx-best-no-scored")
 	p := producerForPrediction(t, name, 2)
 	endpoints, result := endpointAndResult()
 	require.Empty(t, result.ProfileResults["default"].ScoredCandidates)
@@ -360,7 +362,7 @@ func TestPreRequestBestFallsBackToSelected(t *testing.T) {
 func TestPreRequestBestAvailableFallsBackWithoutScoredCandidates(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-best-available-no-scored"
+	name := uniqueName("approx-best-available-no-scored")
 	p := producerForPrediction(t, name, 2)
 	cold, cached := namedEndpoint("cold"), namedEndpoint("cached")
 	pods := []fwksched.Endpoint{cold, cached}
@@ -379,7 +381,7 @@ func TestPreRequestBestAvailableFallsBackWithoutScoredCandidates(t *testing.T) {
 func TestPreRequestMaximaCarryModality(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 
-	const name = "approx-best-modality"
+	name := uniqueName("approx-best-modality")
 	p := producerForPrediction(t, name, 2)
 	endpoints, result := endpointAndResult()
 
@@ -413,6 +415,15 @@ func resultWith(target fwksched.Endpoint, scored ...fwksched.Endpoint) *fwksched
 			"default": {TargetEndpoints: []fwksched.Endpoint{target}, ScoredCandidates: candidates},
 		},
 	}
+}
+
+var uniqueNameSeq atomic.Int64
+
+// uniqueName returns a plugin name no earlier test run used. The prediction
+// metrics live in a process-wide registry and cannot be reset from this
+// package, so a repeated run (-count) needs its own series.
+func uniqueName(base string) string {
+	return base + "-" + strconv.FormatInt(uniqueNameSeq.Add(1), 10)
 }
 
 func producerForPrediction(t *testing.T, name string, blockSize int) *dataProducer {
