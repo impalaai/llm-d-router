@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -227,6 +228,56 @@ func TestValueStoreHonorsDeadline(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, received.Load(), "Redis must receive the command before its deadline")
 	require.Less(t, time.Since(started), time.Second, "a stalled Redis must not hold the caller past its deadline")
+}
+
+// TestValueStoreHonorsDeadlineBeforeConnecting covers a Redis that accepts
+// connections and never answers, met by a client with no pooled connection
+// and, in cluster mode, no slot map.
+func TestValueStoreHonorsDeadlineBeforeConnecting(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+
+	for _, params := range []string{
+		`{"address": %q}`,
+		`{"address": %q, "tls": {}}`,
+		`{"address": %q, "cluster": true}`,
+		`{"address": %q, "cluster": true, "tls": {}}`,
+	} {
+		t.Run(params, func(t *testing.T) {
+			syncer := newSyncerFromParams(t, fmt.Sprintf(params, listener.Addr().String()))
+			for name, call := range map[string]func(context.Context) error{
+				"LoadAndRefresh": func(ctx context.Context) error {
+					_, _, err := syncer.LoadAndRefresh(ctx, valueStateKey, valueID, valueTTL)
+					return err
+				},
+				"LoadOrStore": func(ctx context.Context) error {
+					_, _, err := syncer.LoadOrStore(ctx, valueStateKey, valueID, "e1", valueTTL)
+					return err
+				},
+				"CompareAndSwap": func(ctx context.Context) error {
+					_, _, err := syncer.CompareAndSwap(ctx, valueStateKey, valueID, "e1", "e2", valueTTL)
+					return err
+				},
+			} {
+				ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+				started := time.Now()
+				err := call(ctx)
+				cancel()
+				require.Error(t, err, name)
+				require.Less(t, time.Since(started), time.Second, name)
+			}
+		})
+	}
 }
 
 func TestValueStorePropagatesRedisErrors(t *testing.T) {
