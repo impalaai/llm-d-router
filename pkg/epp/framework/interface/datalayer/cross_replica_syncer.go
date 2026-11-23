@@ -116,6 +116,26 @@ type CrossReplicaValueStore interface {
 	CompareAndSwap(ctx context.Context, key StateKey, id, old, value string, ttl time.Duration) (actual string, swapped bool, err error)
 }
 
+// CrossReplicaSetStore is an optional interface for a CrossReplicaSyncer that
+// stores sets of strings shared by every EPP replica, such as the endpoints
+// that hold one prompt prefix. Each call covers several sets of one state key,
+// identified by ids. Operations on different ids are independent: a call that
+// returns an error may have applied to some ids. Callers bound each call with
+// ctx.
+type CrossReplicaSetStore interface {
+	// AddToSets adds member to the set of every id and resets each set's
+	// expiration to ttl, which must be at least 1ms.
+	AddToSets(ctx context.Context, key StateKey, ids []string, member string, ttl time.Duration) error
+
+	// RemoveFromSets removes member from the set of every id. Expirations are
+	// unchanged.
+	RemoveFromSets(ctx context.Context, key StateKey, ids []string, member string) error
+
+	// LoadSets returns the members of the set of every id, in the order of
+	// ids. A set that is not stored has no members. Expirations are unchanged.
+	LoadSets(ctx context.Context, key StateKey, ids []string) ([][]string, error)
+}
+
 // CrossReplicaContributor is an opt-in interface for endpoint extractors that
 // want their installed attributes to reflect cross-replica aggregate state.
 // The plugin's Extract method is unchanged; the runtime detects this interface
