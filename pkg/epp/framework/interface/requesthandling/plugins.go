@@ -31,6 +31,7 @@ const (
 	ScreenerExtensionPoint          = "Screener"
 	AdmissionExtensionPoint         = "Admission"
 	DataProducerExtensionPoint      = "DataProducer"
+	TargetRevisionExtensionPoint    = "TargetRevision"
 	PreRequestExtensionPoint        = "PreRequest"
 	ResponseReceivedExtensionPoint  = "ResponseReceived"
 	ResponseStreamingExtensionPoint = "ResponseStreaming"
@@ -56,6 +57,17 @@ var ConditionalDecodeHandledAttributeKey = plugin.NewDataKey("conditional-decode
 type Screener interface {
 	plugin.Plugin
 	Screen(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint
+}
+
+// TargetReviser is called by the director after scheduling, before it reads the
+// target endpoints from the result and before PreRequest plugins run. It may
+// replace the TargetEndpoints of a profile result, for example to send the
+// request to the endpoint another EPP replica bound the session to while this
+// replica was scheduling. A replacement must be one of the endpoints that
+// profile scored.
+type TargetReviser interface {
+	plugin.Plugin
+	ReviseTargets(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult)
 }
 
 // PreRequest is called by the director after a getting result from scheduling layer and

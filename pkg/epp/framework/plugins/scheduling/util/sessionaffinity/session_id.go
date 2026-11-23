@@ -209,6 +209,10 @@ type boundPodPresence struct {
 	// pod it held for the session, or "" when it held none.
 	shared    bool
 	sharedPod string
+	// settled reports that ReviseTargets settled the shared pin for this
+	// request, and settledPod is the pod it is pinned to.
+	settled    bool
+	settledPod string
 }
 
 func (b *boundPodPresence) Clone() plugin.StateData {
@@ -369,7 +373,8 @@ func (s *SessionIDHeader) boundPod(sessionID string) string {
 }
 
 // PreRequest commits the binding of a routed request. A session migrates only
-// when its bound pod is absent from the candidate set.
+// when its bound pod is absent from the candidate set. It settles the shared
+// pin itself when ReviseTargets did not run for the request.
 func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
 	sessionID := s.resolveSessionID(ctx, request)
 	if sessionID == "" {
@@ -383,6 +388,10 @@ func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.In
 	present, err := plugin.ReadPluginStateKey[*boundPodPresence](s.pluginState, request.RequestID, s.pluginKey)
 	if err != nil {
 		present = nil
+	}
+	if present != nil && present.settled {
+		s.bindLocal(sessionID, present.settledPod)
+		return
 	}
 	if present != nil && present.shared {
 		if pinned, ok := s.commitSharedPin(ctx, sessionID, podName, present); ok {
@@ -431,21 +440,27 @@ func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.In
 // that profile was not scheduled. An empty profileName selects the primary
 // (decode) profile.
 func (s *SessionIDHeader) pickedPodName(schedulingResult *scheduling.SchedulingResult) string {
-	if schedulingResult == nil {
-		return ""
-	}
-	profileName := s.profileName
-	if profileName == "" {
-		profileName = schedulingResult.PrimaryProfileName
-	}
-	result, ok := schedulingResult.ProfileResults[profileName]
-	if !ok || result == nil || len(result.TargetEndpoints) == 0 || result.TargetEndpoints[0] == nil {
+	result := s.profileResult(schedulingResult)
+	if result == nil || len(result.TargetEndpoints) == 0 || result.TargetEndpoints[0] == nil {
 		return ""
 	}
 	if md := result.TargetEndpoints[0].GetMetadata(); md != nil {
 		return md.ID.String()
 	}
 	return ""
+}
+
+// profileResult returns the result of this instance's profile, or nil when
+// that profile was not scheduled.
+func (s *SessionIDHeader) profileResult(schedulingResult *scheduling.SchedulingResult) *scheduling.ProfileRunResult {
+	if schedulingResult == nil {
+		return nil
+	}
+	profileName := s.profileName
+	if profileName == "" {
+		profileName = schedulingResult.PrimaryProfileName
+	}
+	return schedulingResult.ProfileResults[profileName]
 }
 
 // ResponseHeader is a no-op: under session_id the client owns its

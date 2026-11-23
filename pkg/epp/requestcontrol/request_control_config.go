@@ -33,6 +33,7 @@ func NewConfig() *Config {
 		admissionPlugins:             []fwkrh.Admitter{},
 		requestHandlingDataProducers: []fwkrh.DataProducer{},
 		dataProducerPlugins:          []fwkrh.DataProducer{},
+		targetRevisers:               []fwkrh.TargetReviser{},
 		preRequestPlugins:            []fwkrh.PreRequest{},
 		responseReceivedPlugins:      []fwkrh.ResponseHeaderProcessor{},
 		responseStreamingPlugins:     []fwkrh.ResponseBodyProcessor{},
@@ -47,6 +48,7 @@ type Config struct {
 	admissionPlugins             []fwkrh.Admitter
 	requestHandlingDataProducers []fwkrh.DataProducer
 	dataProducerPlugins          []fwkrh.DataProducer
+	targetRevisers               []fwkrh.TargetReviser
 	preRequestPlugins            []fwkrh.PreRequest
 	responseReceivedPlugins      []fwkrh.ResponseHeaderProcessor
 	responseStreamingPlugins     []fwkrh.ResponseBodyProcessor
@@ -176,6 +178,9 @@ func (c *Config) AddPlugins(pluginObjects ...plugin.Plugin) {
 		if screener, ok := plugin.(fwkrh.Screener); ok {
 			c.screeners = append(c.screeners, screener)
 		}
+		if targetReviser, ok := plugin.(fwkrh.TargetReviser); ok {
+			c.targetRevisers = append(c.targetRevisers, targetReviser)
+		}
 		if preRequestPlugin, ok := plugin.(fwkrh.PreRequest); ok {
 			c.preRequestPlugins = append(c.preRequestPlugins, preRequestPlugin)
 		}
@@ -210,6 +215,7 @@ func (c *Config) OrderPlugins(sortedPluginNames []string) {
 	c.admissionPlugins = orderByName(c.admissionPlugins, rank)
 	c.requestHandlingDataProducers = orderByName(c.requestHandlingDataProducers, rank)
 	c.dataProducerPlugins = orderByName(c.dataProducerPlugins, rank)
+	c.targetRevisers = orderByName(c.targetRevisers, rank)
 	c.preRequestPlugins = orderByName(c.preRequestPlugins, rank)
 	c.responders = orderByName(c.responders, rank)
 	c.responseReceivedPlugins = orderByName(c.responseReceivedPlugins, rank)

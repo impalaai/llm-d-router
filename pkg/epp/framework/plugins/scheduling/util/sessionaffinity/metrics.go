@@ -41,6 +41,9 @@ const (
 	// an absent pod, and moves another replica won.
 	pinResultMoved    = "moved"
 	pinResultMoveLost = "move_lost"
+	// pinResultRedirected counts requests routed to the pod another replica
+	// pinned instead of the pod this replica picked.
+	pinResultRedirected = "redirected"
 	// pinResultError counts store calls that failed or timed out; the request
 	// was routed on the local binding.
 	pinResultError = "error"

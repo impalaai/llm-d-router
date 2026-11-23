@@ -84,6 +84,7 @@ func (p *parameters) validate() error {
 var _ scheduling.Filter = &SessionAffinity{}
 var _ fwkrh.ResponseHeaderProcessor = &SessionAffinity{}
 var _ fwkrh.PreRequest = &SessionAffinity{}
+var _ fwkrh.TargetReviser = &SessionAffinity{}
 
 // Factory defines the factory function for the SessionAffinity filter.
 func Factory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
@@ -161,6 +162,19 @@ func (s *SessionAffinity) Consumes() plugin.DataDependencies {
 // candidates, otherwise all candidate endpoints.
 func (s *SessionAffinity) Filter(ctx context.Context, request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) []scheduling.Endpoint {
 	return s.strategy.filter(ctx, request, endpoints)
+}
+
+// ReviseTargets lets a strategy that shares its bindings across EPP replicas
+// route the request to the pod another replica bound the session to.
+func (s *SessionAffinity) ReviseTargets(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
+	if reviser, ok := s.strategy.(targetReviser); ok {
+		reviser.ReviseTargets(ctx, request, schedulingResult)
+	}
+}
+
+// targetReviser is implemented by strategies that revise scheduled targets.
+type targetReviser interface {
+	ReviseTargets(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult)
 }
 
 // PreRequest records the picked pod for the session.

@@ -183,8 +183,10 @@ func newNamedPinReplica(t *testing.T, syncer plugin.Plugin, typedName plugin.Typ
 // pinRequest is one request of a session on one replica, between its
 // scheduling and its routing.
 type pinRequest struct {
-	replica *pinReplica
-	request *scheduling.InferenceRequest
+	replica    *pinReplica
+	request    *scheduling.InferenceRequest
+	candidates []scheduling.Endpoint
+	result     *scheduling.SchedulingResult
 }
 
 // choose starts a request for sessionID and returns it with the pod Choose
@@ -199,10 +201,34 @@ func (r *pinReplica) choose(sessionID string, pods ...string) (*pinRequest, stri
 		candidates = append(candidates, r.endpoints[pod])
 	}
 	target, ok := r.header.Choose(context.Background(), request, candidates)
+	pending := &pinRequest{replica: r, request: request, candidates: candidates}
 	if !ok || target == nil {
-		return &pinRequest{replica: r, request: request}, ""
+		return pending, ""
 	}
-	return &pinRequest{replica: r, request: request}, target.GetMetadata().ID.Name
+	return pending, target.GetMetadata().ID.Name
+}
+
+// revise passes the scheduler's pick of pod, with scored as the candidates the
+// profile scored (all of the request's candidates when empty), through
+// ReviseTargets and returns the pod the request is routed to.
+func (p *pinRequest) revise(pod string, scored ...string) string {
+	p.result = schedulingResultFor(p.replica.endpoints[pod])
+	profile := p.result.ProfileResults[p.result.PrimaryProfileName]
+	if len(scored) == 0 {
+		for _, candidate := range p.candidates {
+			profile.ScoredCandidates = append(profile.ScoredCandidates, scheduling.ScoredEndpoint{Endpoint: candidate})
+		}
+	}
+	for _, name := range scored {
+		profile.ScoredCandidates = append(profile.ScoredCandidates, scheduling.ScoredEndpoint{Endpoint: p.replica.endpoints[name]})
+	}
+	p.replica.header.ReviseTargets(context.Background(), p.request, p.result)
+	return profile.TargetEndpoints[0].GetMetadata().ID.Name
+}
+
+// commit runs PreRequest on the result revise produced.
+func (p *pinRequest) commit() {
+	p.replica.header.PreRequest(context.Background(), p.request, p.result)
 }
 
 // route commits the request as routed to pod.
@@ -471,4 +497,65 @@ func TestSharedPins_Metrics(t *testing.T) {
 		}
 	}
 	require.Equal(t, map[string]uint64{pinOperationRead: 7, pinOperationCreate: 3, pinOperationMove: 2}, calls)
+}
+
+// Two replicas schedule a new session at once. The replica that loses the
+// create routes its request to the pod the other replica pinned.
+func TestSharedPins_LosingCreateIsRoutedToTheWinner(t *testing.T) {
+	store := newFakePinStore()
+	a, b := newPinReplica(t, store, nil), newPinReplica(t, store, nil)
+	first, _ := a.choose("s1", testPods...)
+	second, _ := b.choose("s1", testPods...)
+
+	require.Equal(t, "pod-a", first.revise("pod-a"))
+	require.Equal(t, "pod-a", second.revise("pod-b"))
+	require.Same(t, b.endpoints["pod-a"], second.result.ProfileResults["default"].TargetEndpoints[0])
+
+	calls := store.callCount()
+	first.commit()
+	second.commit()
+	require.Equal(t, calls, store.callCount(), "PreRequest does not write a pin ReviseTargets settled")
+	require.Equal(t, podKey("pod-a"), b.header.boundPod("s1"))
+}
+
+func TestSharedPins_LosingMoveIsRoutedToTheWinner(t *testing.T) {
+	store := newFakePinStore()
+	a, b := newPinReplica(t, store, nil), newPinReplica(t, store, nil)
+	a.serve("s1", "pod-a")
+	first, _ := a.choose("s1", "pod-b", "pod-c")
+	second, _ := b.choose("s1", "pod-b", "pod-c")
+
+	require.Equal(t, "pod-b", first.revise("pod-b"))
+	require.Equal(t, "pod-b", second.revise("pod-c"))
+}
+
+// The winning pod was a candidate of the request but the profile did not
+// score it, for example because a later filter removed it.
+func TestSharedPins_WinnerOutsideTheScoredCandidatesIsNotRoutedTo(t *testing.T) {
+	store := newFakePinStore()
+	a, b := newPinReplica(t, store, nil), newPinReplica(t, store, nil)
+	first, _ := a.choose("s1", testPods...)
+	second, _ := b.choose("s1", testPods...)
+	first.revise("pod-a")
+
+	require.Equal(t, "pod-b", second.revise("pod-b", "pod-b", "pod-c"))
+	second.commit()
+	require.Equal(t, podKey("pod-a"), b.header.boundPod("s1"), "the stored pin is still bound locally")
+}
+
+func TestSharedPins_ReviseTargetsKeepsThePickWhenTheStoreFails(t *testing.T) {
+	store := newFakePinStore()
+	a := newPinReplica(t, store, nil)
+	request, _ := a.choose("s1", testPods...)
+	store.setErr(errors.New("store down"))
+
+	require.Equal(t, "pod-b", request.revise("pod-b"))
+	request.commit()
+	require.Equal(t, podKey("pod-b"), a.header.boundPod("s1"))
+}
+
+func TestSharedPins_ReviseTargetsLeavesAnUnsharedRequestAlone(t *testing.T) {
+	a := newPinReplica(t, nil, nil)
+	request, _ := a.choose("s1", testPods...)
+	require.Equal(t, "pod-b", request.revise("pod-b"))
 }

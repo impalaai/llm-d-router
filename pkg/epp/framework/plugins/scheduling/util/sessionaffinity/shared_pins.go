@@ -26,6 +26,8 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
 // defaultStoreTimeoutSeconds bounds the shared-pin calls of one request.
@@ -124,6 +126,59 @@ func (s *SessionIDHeader) commitSharedPin(ctx context.Context, sessionID, podNam
 		s.recordPinCall(operation, lost, start)
 	}
 	return pinned, true
+}
+
+// ReviseTargets settles the shared pin of a scheduled request before it is
+// routed. When another replica pinned the session to a different pod in the
+// meantime, the request is routed to that pod, provided the profile scored it.
+// It implements requesthandling.TargetReviser for the owning plugin.
+func (s *SessionIDHeader) ReviseTargets(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
+	sessionID := s.resolveSessionID(ctx, request)
+	if sessionID == "" {
+		return
+	}
+	podName := s.pickedPodName(schedulingResult)
+	if podName == "" {
+		return
+	}
+	presence, err := plugin.ReadPluginStateKey[*boundPodPresence](s.pluginState, request.RequestID, s.pluginKey)
+	if err != nil || presence == nil || !presence.shared {
+		return
+	}
+	pinned, ok := s.commitSharedPin(ctx, sessionID, podName, presence)
+	if !ok {
+		return
+	}
+	settled := *presence
+	settled.settled, settled.settledPod = true, pinned
+	s.pluginState.Write(request.RequestID, s.pluginKey, &settled)
+	if pinned == podName {
+		return
+	}
+
+	profile := s.profileResult(schedulingResult)
+	var winner scheduling.Endpoint
+	for i := range profile.ScoredCandidates {
+		if candidate := profile.ScoredCandidates[i].Endpoint; candidate != nil && candidate.GetMetadata().ID.String() == pinned {
+			winner = candidate
+			break
+		}
+	}
+	if winner == nil {
+		log.FromContext(ctx).V(logging.DEFAULT).Info("Session affinity - the pinned pod was not scored for this request, keeping the picked pod",
+			"plugin", string(s.pluginKey), "pinned", pinned, "picked", podName)
+		return
+	}
+	targets := []scheduling.Endpoint{winner}
+	for _, target := range profile.TargetEndpoints {
+		if target != nil && target.GetMetadata().ID.String() != pinned {
+			targets = append(targets, target)
+		}
+	}
+	profile.TargetEndpoints = targets[:len(profile.TargetEndpoints)]
+	sharedPinResults.WithLabelValues(s.typedName.Name, s.typedName.Type, pinResultRedirected).Inc()
+	log.FromContext(ctx).V(logging.DEFAULT).Info("Session affinity - routing to the pod another replica pinned",
+		"plugin", string(s.pluginKey), "pinned", pinned, "picked", podName)
 }
 
 // bindLocal records podName as the local binding of sessionID.

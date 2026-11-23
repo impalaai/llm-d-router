@@ -97,12 +97,12 @@ Each binding is one key in the store, named by the 64-bit xxhash of the session 
 For each request that carries a session identifier:
 
 1. The plugin reads the key, which also resets its expiration. A stored binding replaces the replica's local one.
-2. A session with no stored binding is scheduled normally. After the request is routed, the replica stores the binding unless another replica stored one first, and then uses the stored one.
+2. A session with no stored binding is scheduled normally. The replica then stores the binding unless another replica stored one first, and uses the stored one.
 3. A stored binding whose pod is not among the request's candidates is replaced with the routed pod, unless another replica replaced it first.
 
 A known session costs one store call per request and a new session two. A replica that starts with an empty local map finds existing bindings in the store.
 
-The request that creates or replaces a binding is routed before the store answers. When several replicas do this for one session at the same moment, each of those requests goes to the pod its own replica picked, and later requests all go to the stored pod.
+The replica stores or replaces the binding after scheduling and before it routes the request. When another replica stored a different pod first, the request is routed to that pod if the scheduling profile scored it, and to the pod this replica picked otherwise.
 
 When a store call fails or takes longer than `storeTimeoutSeconds`, the replica routes on its local binding, or schedules normally when it has none. A local binding is stored again on the next request the store answers and holds no binding for.
 

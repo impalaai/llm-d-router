@@ -606,6 +606,7 @@ func (d *Director) prepareRequest(ctx context.Context, reqCtx *handlers.RequestC
 	if result == nil || len(result.ProfileResults) == 0 {
 		return reqCtx, errcommon.Error{Code: errcommon.Internal, Msg: "results must be greater than zero"}
 	}
+	d.runTargetRevisers(ctx, reqCtx.SchedulingRequest, result)
 	// primary profile is used to set destination
 	primaryResult := result.ProfileResults[result.PrimaryProfileName]
 	targetMetadatas := []*fwkdl.EndpointMetadata{}
@@ -833,6 +834,23 @@ func decodeCapableEndpoint(ep fwkdl.Endpoint) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// runTargetRevisers lets every registered TargetReviser replace target
+// endpoints in the scheduling result.
+func (d *Director) runTargetRevisers(ctx context.Context, request *fwksched.InferenceRequest,
+	schedulingResult *fwksched.SchedulingResult) {
+	logger := log.FromContext(ctx)
+	for _, plugin := range d.requestControlPlugins.targetRevisers {
+		name := plugin.TypedName()
+		scopedRequest, violations := datalayer.ScopeRequest(logger, fwkrh.TargetRevisionExtensionPoint, plugin, request)
+		before := time.Now()
+		plugin.ReviseTargets(ctx, scopedRequest, schedulingResult)
+		metrics.RecordPluginProcessingLatency(fwkrh.TargetRevisionExtensionPoint, name.Type, name.Name, time.Since(before))
+		if err := violations.Write(); err != nil {
+			logger.Error(err, "TargetReviser plugin violated its data scope", "plugin", name)
+		}
 	}
 }
 
