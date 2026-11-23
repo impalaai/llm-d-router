@@ -128,11 +128,7 @@ func resolvePassword(cfg redisConfig) (string, error) {
 	return "", nil
 }
 
-// buildTLSConfig returns nil when cfg is nil, so the connection stays plain TCP.
 func buildTLSConfig(cfg *tlsConfig) (*tls.Config, error) {
-	if cfg == nil {
-		return nil, nil
-	}
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: cfg.ServerName}
 	if cfg.CAFile != "" {
 		pem, err := os.ReadFile(cfg.CAFile)
@@ -175,9 +171,12 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 	if err != nil {
 		return nil, err
 	}
-	tlsCfg, err := buildTLSConfig(cfg.TLS)
-	if err != nil {
-		return nil, err
+	// A nil TLS config keeps the connection on plain TCP.
+	var tlsCfg *tls.Config
+	if cfg.TLS != nil {
+		if tlsCfg, err = buildTLSConfig(cfg.TLS); err != nil {
+			return nil, err
+		}
 	}
 	hostname, _ := os.Hostname()
 	if hostname == "" {

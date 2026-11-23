@@ -19,8 +19,8 @@ package redis
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -65,7 +65,7 @@ func TestIntegrationClusterTLS(t *testing.T) {
 			t.Skip("not a cluster client")
 		}
 		for i := range 64 {
-			_, _, err := syncer.LoadOrStore(t.Context(), "spread", fmt.Sprint(i), "e1", time.Minute)
+			_, _, err := syncer.LoadOrStore(t.Context(), "spread", strconv.Itoa(i), "e1", time.Minute)
 			require.NoError(t, err)
 		}
 		shardsWithKeys := 0
