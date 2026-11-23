@@ -348,6 +348,16 @@ func (s *RedisSyncer) setBatchChunk(ctx context.Context, spec fwkdl.CrossReplica
 		}
 		return failures
 	}
+	if _, ok := s.client.(*goredis.ClusterClient); ok {
+		// A cluster transaction is limited to one hash slot, and each endpoint
+		// hash has its own.
+		for _, endpointID := range chunk {
+			if err := s.Set(ctx, spec, endpointID); err != nil {
+				failures[endpointID] = err
+			}
+		}
+		return failures
+	}
 	logger := ctrl.LoggerFrom(ctx)
 
 	pipe := s.client.TxPipeline()

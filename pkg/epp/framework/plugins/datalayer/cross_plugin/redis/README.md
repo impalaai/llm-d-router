@@ -41,7 +41,9 @@ Parameters:
 - `cluster`: Set to `true` for a Redis Cluster, such as an ElastiCache
   replication group with cluster mode enabled. `address` is then one seed node
   or the configuration endpoint; the client discovers the other nodes and
-  follows slot redirections. Defaults to `false`.
+  follows slot redirections. Each endpoint's state is published in its own
+  transaction, one round trip per endpoint, because a cluster transaction
+  cannot span hash slots. Defaults to `false`.
 - `tls`: Present to connect over TLS 1.2 or newer, for example `tls: {}`. It
   applies to every node in cluster mode. Optional fields:
   - `caFile`: Path to a PEM bundle of CA certificates to trust instead of the
