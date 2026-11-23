@@ -585,21 +585,23 @@ func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.Inferen
 	// Update indexer asynchronously to avoid blocking the request path. The
 	// cell guards against a rollback that lands before this goroutine runs.
 	p.wg.Go(func() {
-		record.cell.mu.Lock()
-		defer record.cell.mu.Unlock()
-		if record.cell.rolledBack {
+		if !p.recordIndexUpdate(record) || p.shared == nil {
 			return
 		}
+		// The shared-key write waits on the store, so it runs without the
+		// cell lock: a failed response must not wait for it.
 		for _, s := range servers {
-			for _, hashes := range state.PerPromptHashes {
-				record.inserted[s.ServerID] = append(record.inserted[s.ServerID], p.indexerInst.Add(hashes, s))
-				if p.syncerActive() {
-					p.recent.record(s.String(), hashes)
-				}
-				if p.shared != nil {
-					p.publishSharedPrefix(s.String(), hashes)
-				}
+			for _, hashes := range record.perPromptHashes {
+				p.publishSharedPrefix(s.String(), hashes)
 			}
+		}
+		record.cell.mu.Lock()
+		rolledBack := record.cell.rolledBack
+		record.cell.mu.Unlock()
+		if rolledBack {
+			// The rollback's withdrawal may have reached the store before
+			// these writes, so withdraw again.
+			p.withdrawSharedRecord(record)
 		}
 	})
 
@@ -634,6 +636,26 @@ func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.Inferen
 	return nil
 }
 
+// recordIndexUpdate adds the request's prompts to the local index for every
+// server of record and keeps what each Add newly inserted. It reports false
+// when the request was rolled back first.
+func (p *dataProducer) recordIndexUpdate(record *indexUpdateRecord) bool {
+	record.cell.mu.Lock()
+	defer record.cell.mu.Unlock()
+	if record.cell.rolledBack {
+		return false
+	}
+	for _, s := range record.servers {
+		for _, hashes := range record.perPromptHashes {
+			record.inserted[s.ServerID] = append(record.inserted[s.ServerID], p.indexerInst.Add(hashes, s))
+			if p.syncerActive() {
+				p.recent.record(s.String(), hashes)
+			}
+		}
+	}
+	return true
+}
+
 // ResponseBody releases the index-update record when the response stream ends,
 // removing the entries PreRequest added when the response reports the request
 // never ran on the model server. A prompt whose request failed must not look
@@ -662,11 +684,8 @@ func (p *dataProducer) ResponseBody(ctx context.Context, request *fwksched.Infer
 	for _, s := range record.servers {
 		// The indexer keeps only what this request's Add newly inserted; a
 		// shared block an earlier request contributed stays indexed.
-		for i, hashes := range record.inserted[s.ServerID] {
+		for _, hashes := range record.inserted[s.ServerID] {
 			p.indexerInst.Remove(hashes, s.ServerID)
-			if p.shared != nil && i < len(record.perPromptHashes) {
-				p.withdrawSharedPrefix(s.String(), record.perPromptHashes[i], hashes)
-			}
 		}
 		// The recent window publishes whole prompts, so the withdrawal is the
 		// request's full prompts, not the inserted subset.
@@ -675,6 +694,9 @@ func (p *dataProducer) ResponseBody(ctx context.Context, request *fwksched.Infer
 				p.recent.removePrompt(s.String(), hashes)
 			}
 		}
+	}
+	if p.shared != nil {
+		p.withdrawSharedRecord(record)
 	}
 	log.FromContext(ctx).V(logutil.DEFAULT).Info("Removed prefix index entries for failed request",
 		"requestID", request.RequestID, "terminationCause", response.TerminationCause)

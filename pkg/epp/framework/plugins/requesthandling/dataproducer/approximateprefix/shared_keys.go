@@ -43,7 +43,8 @@ const (
 	// sharedReadFanout is the number of shared keys one read asks for.
 	sharedReadFanout = 16
 	// sharedReadRounds bounds the reads one prompt can cost. Three rounds
-	// cover 4096 grid positions.
+	// find the longest shared prefix among up to 3856 grid positions; with
+	// more, the result can be one grid position short.
 	sharedReadRounds = 3
 	// sharedFreshCap bounds the record of keys this replica wrote.
 	sharedFreshCap = 200_000
@@ -223,6 +224,19 @@ func (s *sharedPrefixKeys) pruneFreshLocked(now time.Time) {
 	}
 	if len(s.fresh) > sharedFreshCap/2 {
 		clear(s.fresh)
+	}
+}
+
+// withdrawSharedRecord withdraws the shared keys of a rolled-back request.
+// record.inserted[server][i] holds what the request newly added for prompt i.
+// The caller must not run it concurrently with recordIndexUpdate.
+func (p *dataProducer) withdrawSharedRecord(record *indexUpdateRecord) {
+	for _, s := range record.servers {
+		for i, inserted := range record.inserted[s.ServerID] {
+			if i < len(record.perPromptHashes) {
+				p.withdrawSharedPrefix(s.String(), record.perPromptHashes[i], inserted)
+			}
+		}
 	}
 }
 

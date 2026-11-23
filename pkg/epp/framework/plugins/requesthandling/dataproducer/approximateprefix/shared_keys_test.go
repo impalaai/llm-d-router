@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
+	fwkrequest "github.com/llm-d/llm-d-router/pkg/epp/framework/common/request"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -40,8 +41,13 @@ type fakeSetStore struct {
 	sets    map[string]map[string]struct{}
 	addIDs  [][]string
 	loadIDs [][]string
+	removes int
 	err     error
 	stall   bool
+	// gate, when set, holds every AddToSets until it is closed; entered
+	// receives once a held write has started.
+	gate    chan struct{}
+	entered chan struct{}
 }
 
 func newFakeSetStore() *fakeSetStore {
@@ -68,6 +74,20 @@ func (f *fakeSetStore) AddToSets(ctx context.Context, key fwkdl.StateKey, ids []
 		return err
 	}
 	f.mu.Lock()
+	gate, entered := f.gate, f.entered
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.addIDs = append(f.addIDs, ids)
 	for _, id := range ids {
@@ -86,6 +106,7 @@ func (f *fakeSetStore) RemoveFromSets(ctx context.Context, key fwkdl.StateKey, i
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.removes++
 	for _, id := range ids {
 		k := string(key) + "/" + id
 		delete(f.sets[k], member)
@@ -419,4 +440,218 @@ func TestSharedKeysSearchNarrowsToTheLongestPrefix(t *testing.T) {
 
 	_, loads, _ := store.counts()
 	require.Equal(t, 2, loads-before)
+}
+
+func TestSharedKeysFailedResponseDoesNotWaitForPublish(t *testing.T) {
+	store := newFakeSetStore()
+	p := newSharingProducer(t, store)
+	p.shared.writeTimeout = time.Minute
+	e1 := testEndpoint("e1")
+	pods := []fwksched.Endpoint{e1}
+	store.gate, store.entered = make(chan struct{}), make(chan struct{}, 1)
+
+	req := &fwksched.InferenceRequest{RequestID: "held-write", TargetModel: "m", Body: tokenizedBody(tokens(20))}
+	require.NoError(t, p.Produce(context.Background(), req, pods))
+	res := &fwksched.SchedulingResult{
+		PrimaryProfileName: "default",
+		ProfileResults:     map[string]*fwksched.ProfileRunResult{"default": {TargetEndpoints: []fwksched.Endpoint{e1}}},
+	}
+	require.NoError(t, p.PreRequest(context.Background(), req, res))
+	<-store.entered
+
+	done := make(chan struct{})
+	go func() {
+		p.ResponseBody(context.Background(), req, failedResponse(req.RequestID), nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(store.gate)
+		<-done
+		t.Fatal("the failed response waited for the shared-key write")
+	}
+	// Let the rollback's withdrawal reach the store before the write does.
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.removes == 1
+	}, 5*time.Second, time.Millisecond)
+	close(store.gate)
+	p.wg.Wait()
+
+	_, _, keys := store.counts()
+	require.Zero(t, keys, "a write that lands after the rollback is withdrawn")
+	require.Equal(t, []int{0}, matched(t, p, pods, tokens(20)))
+}
+
+// searchRange returns a producer, n chained hashes and their positions 1..n,
+// standing in for a prompt with a shared key at every block.
+func searchRange(t *testing.T, store *fakeSetStore, n int) (*dataProducer, []blockHash, []int) {
+	t.Helper()
+	p := newSharingProducer(t, store)
+	hashes, positions := make([]blockHash, n), make([]int, n)
+	for i := range hashes {
+		hashes[i], positions[i] = blockHash(i+1), i+1
+	}
+	return p, hashes, positions
+}
+
+func TestSearchSharedPrefixEdges(t *testing.T) {
+	const member = "default/e1"
+	podByID := map[string]int{member: 0}
+	for _, tc := range []struct {
+		positions int
+		// shortBy is how far below the longest stored prefix the result may be.
+		shortBy int
+	}{
+		{positions: 1},
+		{positions: 2},
+		{positions: sharedReadFanout},
+		{positions: sharedReadFanout + 1},
+		{positions: 257},
+		{positions: 3856},
+		{positions: 4096, shortBy: 1},
+	} {
+		store := newFakeSetStore()
+		p, hashes, positions := searchRange(t, store, tc.positions)
+		// held grows by one each step, so every boundary is searched.
+		for held := 0; held <= tc.positions; held++ {
+			if held > 0 {
+				require.NoError(t, store.AddToSets(t.Context(), p.shared.stateKey, []string{sharedID(hashes[held-1])}, member, time.Minute))
+			}
+			store.loadIDs = nil
+			found, err := p.searchSharedPrefix(t.Context(), store, hashes, positions, podByID)
+			require.NoError(t, err)
+			if found[0] > held || found[0] < held-tc.shortBy {
+				t.Fatalf("%d positions, %d held: found %d", tc.positions, held, found[0])
+			}
+			if held == 0 && len(store.loadIDs) != 1 {
+				t.Fatalf("%d positions, none held: %d reads", tc.positions, len(store.loadIDs))
+			}
+			if len(store.loadIDs) > sharedReadRounds {
+				t.Fatalf("%d positions, %d held: %d reads", tc.positions, held, len(store.loadIDs))
+			}
+			for _, ids := range store.loadIDs {
+				require.LessOrEqual(t, len(ids), sharedReadFanout)
+			}
+		}
+	}
+}
+
+func TestSearchSharedPrefixWithExpiredMiddleKeys(t *testing.T) {
+	const member = "default/e1"
+	store := newFakeSetStore()
+	p, hashes, positions := searchRange(t, store, 100)
+	var ids []string
+	for c := 1; c <= 100; c++ {
+		// Keys 11 to 29 and 41 onward are not stored.
+		if c <= 10 || (c >= 30 && c <= 40) {
+			ids = append(ids, sharedID(hashes[c-1]))
+		}
+	}
+	require.NoError(t, store.AddToSets(t.Context(), p.shared.stateKey, ids, member, time.Minute))
+	store.loadIDs = nil
+
+	found, err := p.searchSharedPrefix(t.Context(), store, hashes, positions, map[string]int{member: 0})
+	require.NoError(t, err)
+	require.Equal(t, 40, found[0], "a later stored key counts although shorter ones expired")
+	require.LessOrEqual(t, len(store.loadIDs), sharedReadRounds)
+}
+
+func TestSpreadIndexes(t *testing.T) {
+	for _, tc := range []struct{ lo, hi int }{{-1, 0}, {-1, 1}, {-1, 16}, {-1, 17}, {-1, 18}, {4, 21}, {4, 22}, {-1, 4096}, {100, 100000}} {
+		got := spreadIndexes(tc.lo, tc.hi, sharedReadFanout)
+		size := tc.hi - tc.lo - 1
+		require.Len(t, got, min(size, sharedReadFanout), "range (%d, %d)", tc.lo, tc.hi)
+		for k, idx := range got {
+			require.Greater(t, idx, tc.lo)
+			require.Less(t, idx, tc.hi)
+			if k > 0 {
+				require.Greater(t, idx, got[k-1], "range (%d, %d): indexes ascend without repeats", tc.lo, tc.hi)
+			}
+		}
+		if size > 0 {
+			require.Equal(t, tc.lo+1, got[0])
+			require.Equal(t, tc.hi-1, got[len(got)-1])
+		}
+	}
+}
+
+func TestSharedKeysFollowUpTurnReadsOnlyKeysPastTheLocalRun(t *testing.T) {
+	store := newFakeSetStore()
+	p := newSharingProducer(t, store)
+	e1 := testEndpoint("e1")
+	pods := []fwksched.Endpoint{e1}
+	route(t, p, pods, e1, tokens(20))
+	store.loadIDs = nil
+
+	require.Equal(t, []int{20}, matched(t, p, pods, tokens(20)))
+	require.Empty(t, store.loadIDs, "a prompt the local index covers costs no read")
+
+	require.Equal(t, []int{20}, matched(t, p, pods, tokens(45)))
+	require.Equal(t, [][]string{sharedIDs(t, p, tokens(45), 24, 32, 40, 45)}, store.loadIDs,
+		"one read of the grid keys past block 20")
+}
+
+func TestSharedKeysFreshRecordsStayCapped(t *testing.T) {
+	store := newFakeSetStore()
+	p := newSharingProducer(t, store)
+	now := time.Now()
+	p.shared.now = func() time.Time { return now }
+	e1 := testEndpoint("e1")
+	pods := []fwksched.Endpoint{e1}
+	fill := func(written time.Time) {
+		for i := range sharedFreshCap {
+			p.shared.fresh[sharedMark{endpointID: "filler", hash: blockHash(i)}] = written
+		}
+	}
+
+	fill(now.Add(-p.shared.ttl))
+	route(t, p, pods, e1, tokens(20))
+	require.Len(t, p.shared.fresh, 3, "records too old to hold back a write are dropped")
+
+	fill(now)
+	route(t, p, pods, e1, tokens(24))
+	require.Len(t, p.shared.fresh, 1, "records that are all current are cleared at the cap")
+
+	adds, _, _ := store.counts()
+	route(t, p, pods, e1, tokens(20))
+	addsAfter, _, _ := store.counts()
+	require.Equal(t, adds+1, addsAfter, "a cleared record costs one more write")
+	require.Equal(t, []int{24}, matched(t, newSharingProducer(t, store), pods, tokens(24)), "the shared keys are unchanged")
+}
+
+func TestSharedKeysRollbackPairsPromptsAndServers(t *testing.T) {
+	store := newFakeSetStore()
+	p := newSharingProducer(t, store)
+	decode, prefill := testEndpoint("decode"), testEndpoint("prefill")
+	pods := []fwksched.Endpoint{decode, prefill}
+	first, second := tokens(16), []uint32{101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112}
+	// An earlier request leaves the first prompt on the decode endpoint.
+	route(t, p, pods, decode, first)
+
+	req := &fwksched.InferenceRequest{RequestID: "two-prompts", TargetModel: "m", Body: &fwkrequest.InferenceRequestBody{
+		TokenizedRequest: &fwkrequest.TokenizedRequest{Prompts: []fwkrequest.PromptTokens{{TokenIDs: first}, {TokenIDs: second}}},
+	}}
+	require.NoError(t, p.Produce(context.Background(), req, pods))
+	res := &fwksched.SchedulingResult{
+		PrimaryProfileName: "decode",
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			"decode":                          {TargetEndpoints: []fwksched.Endpoint{decode}},
+			experimentalDefaultPrefillProfile: {TargetEndpoints: []fwksched.Endpoint{prefill}},
+		},
+	}
+	require.NoError(t, p.PreRequest(context.Background(), req, res))
+	p.wg.Wait()
+	fresh := newSharingProducer(t, store)
+	require.Equal(t, []int{16, 16}, matched(t, fresh, pods, first))
+	require.Equal(t, []int{12, 12}, matched(t, fresh, pods, second))
+
+	p.ResponseBody(context.Background(), req, failedResponse(req.RequestID), nil)
+	p.wg.Wait()
+
+	fresh = newSharingProducer(t, store)
+	require.Equal(t, []int{16, 0}, matched(t, fresh, pods, first), "the earlier request's keys keep the decode endpoint")
+	require.Equal(t, []int{0, 0}, matched(t, fresh, pods, second), "the failed request's own keys lose both endpoints")
 }
