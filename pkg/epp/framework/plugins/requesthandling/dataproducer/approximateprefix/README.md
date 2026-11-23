@@ -23,6 +23,10 @@ Setting both caps to `0` matches the whole prompt. Prompt length is bounded by t
 - `syncCrossReplicaState` (bool, optional, default: `true`): When a `CrossReplicaSyncer` (for example `redis-syncer`) is configured, publish a capped recent window of per-prompt prefix block hashes per decode endpoint and merge peer-only prompts into the local indexer before matching. Local recent-window prompts are not re-applied on every request. This shares recent placements across active-active EPP replicas; it does not snapshot the full local LRU and is not a restart restore. Set `false` to keep the producer local-only. See also [operations](../../../../../../../docs/operations.md#scaling-modes-active-active-vs-active-passive).
 - `maxSyncedTokens` (int, optional, default: `2000000`): Cap on total tokens kept in each replica's per-endpoint recent window published through the syncer (`hash budget = maxSyncedTokens / blockSizeTokens`). Default matches the default per-pod index size (`lruCapacityPerServer` × `blockSizeTokens`). Aggregate unions replica windows without re-applying this cap, so N replicas can contribute up to N windows of peer state.
 - `excludeDecodeWhenDisaggregated` (bool, optional, default: `false`): Record a disaggregated request, one that also picked a prefill endpoint, on the prefill endpoint only. Set it for hybrid Mamba/GDN models served with P/D: their decode endpoints cannot serve a prefix hit from KV received over the P/D transfer, so without it `prefix-based-pd-decider` skips prefill on a repeat and the decode endpoint recomputes the whole prompt. It also removes decode-side prefix affinity for disaggregated requests: the decode profile's prefix scorer no longer prefers the decode endpoint that served the prompt, so a repeat may land on a different decode endpoint. Decode-only requests still record the decode endpoint.
+- `sharedPrefixKeys` (object, optional, default: unset): Share which endpoints hold a prompt prefix as one key per prefix, through a `CrossReplicaSyncer` that stores sets (`redis-syncer`). Present, even when empty, turns it on. See [Shared prefix keys](#shared-prefix-keys).
+  - `ttl` (duration, default: `10m`, minimum `1s`): How long a shared key lives after its last write. Choose about how long a model server keeps a prefix cached.
+  - `gridBlocks` (int, default: `8`): Spacing, in blocks, of the prefix lengths that get a key.
+  - `readTimeout` (duration, default: `50ms`): Bound on the shared-key reads of one request.
 - `blockSize` (int, optional): Deprecated — character-based block size. Use `blockSizeTokens` instead.
 
 **Configuration Examples:**
@@ -61,6 +65,17 @@ plugins:
 ```
 
 ---
+
+## Shared prefix keys
+
+`sharedPrefixKeys` shares prefix placements between EPP replicas and keeps them across an EPP restart. It needs Redis 7.0, so it works where `syncCrossReplicaState` does not (that path needs Redis 7.4). Set `syncCrossReplicaState: false` when using it, so the two do not both publish.
+
+- **Keys.** A prompt gets a key for every `gridBlocks`-th block and for its last block. Each key holds the set of endpoints that were sent that prefix.
+- **Writes.** After a request is routed, the producer adds the endpoint to the prompt's keys in one batched write off the request path. A key this replica wrote within a third of `ttl` is not written again. A failed request removes the endpoint from the keys it added.
+- **Reads.** When the local index does not cover a prompt, the producer reads the keys past the longest locally known prefix and adds what it finds to the local index. A prompt no replica has seen costs one read; otherwise the search takes at most three reads of 16 keys.
+- **Precision.** A prefix learned from shared keys matches up to the last grid block, so up to `gridBlocks - 1` blocks short of what the endpoint holds.
+- **Failure.** A read error or timeout leaves the local index as the only source for that request. A failed write is retried on the next request for the prefix.
+- **Restart.** A replica that starts with an empty index recovers each prefix on the first request that carries it. Prefixes whose keys expired, or were never written because the store was unreachable, are not recovered.
 
 ## Related Documentation
 - [Prefix Cache Scorer](../../../scheduling/scorer/prefix/README.md)

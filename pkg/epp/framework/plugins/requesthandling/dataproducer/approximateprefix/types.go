@@ -248,6 +248,9 @@ type config struct {
 	// for hybrid Mamba/GDN models whose decode endpoints cannot reuse KV received over the P/D
 	// transfer. It also removes decode-side prefix affinity for disaggregated requests.
 	ExcludeDecodeWhenDisaggregated bool `json:"excludeDecodeWhenDisaggregated,omitempty"`
+	// SharedPrefixKeys shares which endpoints hold a prompt prefix as one key
+	// per prefix through a CrossReplicaSyncer that stores sets. Unset is off.
+	SharedPrefixKeys *sharedPrefixKeysConfig `json:"sharedPrefixKeys,omitempty"`
 }
 
 // defaultConfig provides sensible defaults for the prefix cache plugins.

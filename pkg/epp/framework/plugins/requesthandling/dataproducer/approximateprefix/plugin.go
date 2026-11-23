@@ -87,6 +87,8 @@ type dataProducer struct {
 	syncHashDK            plugin.DataKey
 	syncCrossReplicaState bool
 	recent                *recentWindow
+	// shared is nil unless sharedPrefixKeys is configured.
+	shared *sharedPrefixKeys
 	// registeredEndpoints maps endpointID to the Endpoint pointer last seen on
 	// AddOrUpdate so Extract can ignore stale deletes for a replaced object.
 	registeredEndpoints sync.Map
@@ -235,6 +237,10 @@ func newDataProducer(ctx context.Context, name string, config config, handle plu
 		syncCrossReplicaState = *config.SyncCrossReplicaState
 	}
 	maxSynced := syncedHashBudget(config)
+	shared, err := newSharedPrefixKeys(name, config.SharedPrefixKeys)
+	if err != nil {
+		return nil, err
+	}
 
 	p := &dataProducer{
 		typedName: plugin.TypedName{
@@ -249,6 +255,7 @@ func newDataProducer(ctx context.Context, name string, config config, handle plu
 		syncHashDK:            attrprefix.PrefixHashSetDataKey.WithNonEmptyProducerName(name),
 		syncCrossReplicaState: syncCrossReplicaState,
 		recent:                newRecentWindow(maxSynced),
+		shared:                shared,
 	}
 
 	go p.CleanUpInactivePods(ctx, handle)
@@ -335,8 +342,18 @@ func (p *dataProducer) Produce(ctx context.Context, request *fwksched.InferenceR
 	prefixCacheServers := make(map[ServerID]int)
 	predictedCachedTokens := make(map[ServerID]int)
 	totalBlocks := 0
+	sharedCtx := ctx
+	if p.shared != nil {
+		var cancel context.CancelFunc
+		sharedCtx, cancel = context.WithTimeout(ctx, p.shared.readTimeout)
+		defer cancel()
+	}
 	for i, hashes := range perPromptHashes {
-		for j, matchLen := range p.indexerInst.MatchLongestPrefix(hashes, candidates) {
+		matches := p.indexerInst.MatchLongestPrefix(hashes, candidates)
+		if p.shared != nil && p.restoreSharedPrefix(sharedCtx, hashes, pods, matches) {
+			matches = p.indexerInst.MatchLongestPrefix(hashes, candidates)
+		}
+		for j, matchLen := range matches {
 			if matchLen == 0 {
 				continue
 			}
@@ -579,6 +596,9 @@ func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.Inferen
 				if p.syncerActive() {
 					p.recent.record(s.String(), hashes)
 				}
+				if p.shared != nil {
+					p.publishSharedPrefix(s.String(), hashes)
+				}
 			}
 		}
 	})
@@ -642,8 +662,11 @@ func (p *dataProducer) ResponseBody(ctx context.Context, request *fwksched.Infer
 	for _, s := range record.servers {
 		// The indexer keeps only what this request's Add newly inserted; a
 		// shared block an earlier request contributed stays indexed.
-		for _, hashes := range record.inserted[s.ServerID] {
+		for i, hashes := range record.inserted[s.ServerID] {
 			p.indexerInst.Remove(hashes, s.ServerID)
+			if p.shared != nil && i < len(record.perPromptHashes) {
+				p.withdrawSharedPrefix(s.String(), record.perPromptHashes[i], hashes)
+			}
 		}
 		// The recent window publishes whole prompts, so the withdrawal is the
 		// request's full prompts, not the inserted subset.
