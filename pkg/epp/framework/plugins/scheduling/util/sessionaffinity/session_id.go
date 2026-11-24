@@ -54,8 +54,8 @@ type SessionIDConfig struct {
 	// per-key values. Unset defaults to true; set false to keep bindings local
 	// to this replica.
 	SyncCrossReplicaState *bool `json:"syncCrossReplicaState,omitempty"`
-	// StoreTimeoutSeconds bounds the shared-store calls of one request in each
-	// of Choose and PreRequest. 0 defaults to defaultStoreTimeoutSeconds.
+	// StoreTimeoutSeconds bounds each shared-store call. A request makes at
+	// most one read and one write. 0 defaults to defaultStoreTimeoutSeconds.
 	StoreTimeoutSeconds float64 `json:"storeTimeoutSeconds,omitempty"`
 }
 

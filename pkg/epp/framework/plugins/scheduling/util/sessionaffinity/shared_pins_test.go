@@ -559,3 +559,60 @@ func TestSharedPins_ReviseTargetsLeavesAnUnsharedRequestAlone(t *testing.T) {
 	request, _ := a.choose("s1", testPods...)
 	require.Equal(t, "pod-b", request.revise("pod-b"))
 }
+
+// The pinned pod is a candidate and the scheduler picked another pod, as it
+// can when other scorers outweigh the affinity score. No replica changed the
+// pin, so the request keeps the pod the scheduler picked.
+func TestSharedPins_OutvotedPresentPinIsNotRoutedTo(t *testing.T) {
+	store := newFakePinStore()
+	a := newPinReplica(t, store, nil)
+	a.serve("s1", "pod-a")
+
+	request, pinned := a.choose("s1", "pod-a", "pod-b")
+	require.Equal(t, "pod-a", pinned)
+	require.Equal(t, "pod-b", request.revise("pod-b"))
+	request.commit()
+
+	require.Equal(t, []string{podKey("pod-a")}, store.pins())
+	require.Equal(t, podKey("pod-a"), a.header.boundPod("s1"))
+}
+
+// The store answers the read and fails the write. PreRequest binds locally
+// without a second write.
+func TestSharedPins_FailedWriteIsNotRepeatedInPreRequest(t *testing.T) {
+	store := newFakePinStore()
+	a := newPinReplica(t, store, nil)
+	request, _ := a.choose("s1", testPods...)
+	store.setErr(errors.New("store down"))
+
+	require.Equal(t, "pod-b", request.revise("pod-b"))
+	request.commit()
+
+	require.Equal(t, 2, store.callCount(), "one read and one write")
+	require.Equal(t, podKey("pod-b"), a.header.boundPod("s1"))
+}
+
+func TestSharedPins_StoreCallsPerRequest(t *testing.T) {
+	store := newFakePinStore()
+	a := newPinReplica(t, store, nil)
+	serve := func(pod string, candidates ...string) int {
+		before := store.callCount()
+		request, pinned := a.choose("s1", candidates...)
+		if pinned != "" {
+			pod = pinned
+		}
+		request.revise(pod)
+		request.commit()
+		return store.callCount() - before
+	}
+
+	require.Equal(t, 2, serve("pod-a", testPods...), "a new session costs a read and a create")
+	require.Equal(t, 1, serve("pod-c", testPods...), "a known session costs a read")
+	require.Equal(t, 2, serve("pod-b", "pod-b", "pod-c"), "a moved session costs a read and a move")
+}
+
+func TestRegisterMetrics_SecondInstanceOnOneRegistry(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	require.NoError(t, registerMetrics(registry))
+	require.NoError(t, registerMetrics(registry))
+}

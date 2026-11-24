@@ -146,13 +146,17 @@ func (s *SessionIDHeader) ReviseTargets(ctx context.Context, request *scheduling
 		return
 	}
 	pinned, ok := s.commitSharedPin(ctx, sessionID, podName, presence)
+	settled := *presence
 	if !ok {
+		// PreRequest then binds locally and does not repeat the failed write.
+		settled.shared = false
+		s.pluginState.Write(request.RequestID, s.pluginKey, &settled)
 		return
 	}
-	settled := *presence
 	settled.settled, settled.settledPod = true, pinned
 	s.pluginState.Write(request.RequestID, s.pluginKey, &settled)
-	if pinned == podName {
+	// A pin equal to the one Choose read was already an input to scheduling.
+	if pinned == podName || pinned == presence.sharedPod {
 		return
 	}
 
