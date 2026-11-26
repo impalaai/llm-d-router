@@ -130,9 +130,7 @@ func TestIntegrationSharedPins(t *testing.T) {
 
 		require.Zero(t, delta[pinResultError], "store calls that failed or timed out")
 		requireOnePodPerSession(t, replicas, sessions, routed)
-		// Two replicas pick the same pod here, and a move that finds the pin
-		// already on its own pick counts as moved.
-		require.GreaterOrEqual(t, delta[pinResultMoved], float64(len(sessions)), "a move wins for every session")
+		require.EqualValues(t, len(sessions), delta[pinResultMoved], "one move wins per session")
 		for i := range sessions {
 			require.NotEqual(t, pinned[i], routed[i][0], "session %d stayed on the pod that left", i)
 		}

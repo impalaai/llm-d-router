@@ -499,6 +499,34 @@ func TestSharedPins_Metrics(t *testing.T) {
 	require.Equal(t, map[string]uint64{pinOperationRead: 7, pinOperationCreate: 3, pinOperationMove: 2}, calls)
 }
 
+// Two replicas that pick the same pod at once write the same pin. Only the
+// replica whose write stored it counts a create or a move.
+func TestSharedPins_MetricsCountTheWriteThatStored(t *testing.T) {
+	store := newFakePinStore()
+	name := plugin.TypedName{Type: "session-affinity-test", Name: t.Name() + "-" + strconv.FormatInt(metricsTestRuns.Add(1), 10)}
+	a, b := newNamedPinReplica(t, store, name, nil), newNamedPinReplica(t, store, name, nil)
+
+	first, _ := a.choose("s1", testPods...)
+	second, _ := b.choose("s1", testPods...)
+	first.route("pod-a")
+	second.route("pod-a")
+
+	first, _ = a.choose("s1", "pod-b", "pod-c")
+	second, _ = b.choose("s1", "pod-b", "pod-c")
+	first.route("pod-b")
+	second.route("pod-b")
+
+	for result, count := range map[string]float64{
+		pinResultCreated:    1,
+		pinResultCreateLost: 1,
+		pinResultMoved:      1,
+		pinResultMoveLost:   1,
+		pinResultRedirected: 0,
+	} {
+		require.Equal(t, count, testutil.ToFloat64(sharedPinResults.WithLabelValues(name.Name, name.Type, result)), result)
+	}
+}
+
 // Two replicas schedule a new session at once. The replica that loses the
 // create routes its request to the pod the other replica pinned.
 func TestSharedPins_LosingCreateIsRoutedToTheWinner(t *testing.T) {

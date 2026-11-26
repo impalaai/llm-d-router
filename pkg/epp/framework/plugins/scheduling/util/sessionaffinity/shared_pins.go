@@ -108,11 +108,14 @@ func (s *SessionIDHeader) commitSharedPin(ctx context.Context, sessionID, podNam
 	operation, won, lost := pinOperationCreate, pinResultCreated, pinResultCreateLost
 	start := time.Now()
 	var err error
+	var stored bool
 	if presence.sharedPod == "" {
-		pinned, _, err = store.LoadOrStore(ctx, s.pinStateKey, sharedPinID(sessionID), podName, s.ttl)
+		var loaded bool
+		pinned, loaded, err = store.LoadOrStore(ctx, s.pinStateKey, sharedPinID(sessionID), podName, s.ttl)
+		stored = !loaded
 	} else {
 		operation, won, lost = pinOperationMove, pinResultMoved, pinResultMoveLost
-		pinned, _, err = store.CompareAndSwap(ctx, s.pinStateKey, sharedPinID(sessionID), presence.sharedPod, podName, s.ttl)
+		pinned, stored, err = store.CompareAndSwap(ctx, s.pinStateKey, sharedPinID(sessionID), presence.sharedPod, podName, s.ttl)
 	}
 	if err != nil {
 		s.recordPinCall(operation, pinResultError, start)
@@ -120,7 +123,7 @@ func (s *SessionIDHeader) commitSharedPin(ctx context.Context, sessionID, podNam
 			"plugin", string(s.pluginKey), "error", err.Error())
 		return "", false
 	}
-	if pinned == podName {
+	if stored {
 		s.recordPinCall(operation, won, start)
 	} else {
 		s.recordPinCall(operation, lost, start)
