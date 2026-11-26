@@ -147,6 +147,24 @@ cluster mode the keys spread across shards. `ttl` must be at least `1ms`.
 Every call is bounded by its caller's context and returns Redis errors as is;
 the caller decides how to fall back.
 
+## Set Store
+
+The plugin implements the optional `CrossReplicaSetStore` interface: sets of
+strings that every EPP replica adds to and reads, several sets per call. A
+plugin uses it for state with many small entries, such as the endpoints that
+hold one prompt prefix.
+
+| Method | Redis commands | Result |
+|---|---|---|
+| `AddToSets` | `SADD` and `PEXPIRE` in one script per set | Adds the member and resets the set's expiration to `ttl`. |
+| `RemoveFromSets` | `SREM` | Removes the member. |
+| `LoadSets` | `SMEMBERS` | The members of each set, in the order asked. |
+
+Keys are `<keyPrefix>:set:<stateKey>:<id>`. Each call sends its commands in one
+pipeline, which in cluster mode is split by node. The sets of one call are
+independent: after an error, some may have been written. All commands work on
+Redis 7.0.
+
 ## Scheduling and Admission
 
 Periodic endpoint synchronization provides peer-aware scheduling state. It is

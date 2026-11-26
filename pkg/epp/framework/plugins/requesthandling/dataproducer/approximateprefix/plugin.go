@@ -87,6 +87,8 @@ type dataProducer struct {
 	syncHashDK            plugin.DataKey
 	syncCrossReplicaState bool
 	recent                *recentWindow
+	// shared is nil unless sharedPrefixKeys is configured.
+	shared *sharedPrefixKeys
 	// registeredEndpoints maps endpointID to the Endpoint pointer last seen on
 	// AddOrUpdate so Extract can ignore stale deletes for a replaced object.
 	registeredEndpoints sync.Map
@@ -235,6 +237,10 @@ func newDataProducer(ctx context.Context, name string, config config, handle plu
 		syncCrossReplicaState = *config.SyncCrossReplicaState
 	}
 	maxSynced := syncedHashBudget(config)
+	shared, err := newSharedPrefixKeys(name, config.SharedPrefixKeys)
+	if err != nil {
+		return nil, err
+	}
 
 	p := &dataProducer{
 		typedName: plugin.TypedName{
@@ -249,6 +255,7 @@ func newDataProducer(ctx context.Context, name string, config config, handle plu
 		syncHashDK:            attrprefix.PrefixHashSetDataKey.WithNonEmptyProducerName(name),
 		syncCrossReplicaState: syncCrossReplicaState,
 		recent:                newRecentWindow(maxSynced),
+		shared:                shared,
 	}
 
 	go p.CleanUpInactivePods(ctx, handle)
@@ -335,8 +342,18 @@ func (p *dataProducer) Produce(ctx context.Context, request *fwksched.InferenceR
 	prefixCacheServers := make(map[ServerID]int)
 	predictedCachedTokens := make(map[ServerID]int)
 	totalBlocks := 0
+	sharedCtx := ctx
+	if p.shared != nil {
+		var cancel context.CancelFunc
+		sharedCtx, cancel = context.WithTimeout(ctx, p.shared.readTimeout)
+		defer cancel()
+	}
 	for i, hashes := range perPromptHashes {
-		for j, matchLen := range p.indexerInst.MatchLongestPrefix(hashes, candidates) {
+		matches := p.indexerInst.MatchLongestPrefix(hashes, candidates)
+		if p.shared != nil && p.restoreSharedPrefix(sharedCtx, hashes, pods, matches) {
+			matches = p.indexerInst.MatchLongestPrefix(hashes, candidates)
+		}
+		for j, matchLen := range matches {
 			if matchLen == 0 {
 				continue
 			}
@@ -568,18 +585,23 @@ func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.Inferen
 	// Update indexer asynchronously to avoid blocking the request path. The
 	// cell guards against a rollback that lands before this goroutine runs.
 	p.wg.Go(func() {
-		record.cell.mu.Lock()
-		defer record.cell.mu.Unlock()
-		if record.cell.rolledBack {
+		if !p.recordIndexUpdate(record) || p.shared == nil {
 			return
 		}
+		// The shared-key write waits on the store, so it runs without the
+		// cell lock: a failed response must not wait for it.
 		for _, s := range servers {
-			for _, hashes := range state.PerPromptHashes {
-				record.inserted[s.ServerID] = append(record.inserted[s.ServerID], p.indexerInst.Add(hashes, s))
-				if p.syncerActive() {
-					p.recent.record(s.String(), hashes)
-				}
+			for _, hashes := range record.perPromptHashes {
+				p.publishSharedPrefix(s.String(), hashes)
 			}
+		}
+		record.cell.mu.Lock()
+		rolledBack := record.cell.rolledBack
+		record.cell.mu.Unlock()
+		if rolledBack {
+			// The rollback's withdrawal may have reached the store before
+			// these writes, so withdraw again.
+			p.withdrawSharedRecord(record)
 		}
 	})
 
@@ -612,6 +634,26 @@ func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.Inferen
 		})
 	}
 	return nil
+}
+
+// recordIndexUpdate adds the request's prompts to the local index for every
+// server of record and keeps what each Add newly inserted. It reports false
+// when the request was rolled back first.
+func (p *dataProducer) recordIndexUpdate(record *indexUpdateRecord) bool {
+	record.cell.mu.Lock()
+	defer record.cell.mu.Unlock()
+	if record.cell.rolledBack {
+		return false
+	}
+	for _, s := range record.servers {
+		for _, hashes := range record.perPromptHashes {
+			record.inserted[s.ServerID] = append(record.inserted[s.ServerID], p.indexerInst.Add(hashes, s))
+			if p.syncerActive() {
+				p.recent.record(s.String(), hashes)
+			}
+		}
+	}
+	return true
 }
 
 // ResponseBody releases the index-update record when the response stream ends,
@@ -652,6 +694,9 @@ func (p *dataProducer) ResponseBody(ctx context.Context, request *fwksched.Infer
 				p.recent.removePrompt(s.String(), hashes)
 			}
 		}
+	}
+	if p.shared != nil {
+		p.withdrawSharedRecord(record)
 	}
 	log.FromContext(ctx).V(logutil.DEFAULT).Info("Removed prefix index entries for failed request",
 		"requestID", request.RequestID, "terminationCause", response.TerminationCause)

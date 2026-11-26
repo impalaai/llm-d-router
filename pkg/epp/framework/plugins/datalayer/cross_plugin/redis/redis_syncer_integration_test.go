@@ -122,6 +122,29 @@ func TestIntegrationClusterTLS(t *testing.T) {
 		require.NoError(t, err)
 		require.Greater(t, ttl, 9*time.Minute, "the swap sets the new expiration")
 	})
+
+	t.Run("sets across shards", func(t *testing.T) {
+		ids := make([]string, 64)
+		for i := range ids {
+			ids[i] = strconv.Itoa(i)
+		}
+		require.NoError(t, syncer.AddToSets(t.Context(), "prefix", ids, "e1", time.Minute))
+		require.NoError(t, syncer.AddToSets(t.Context(), "prefix", ids[:32], "e2", time.Minute))
+
+		sets, err := syncer.LoadSets(t.Context(), "prefix", ids)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []string{"e1", "e2"}, sets[0])
+		require.Equal(t, []string{"e1"}, sets[63])
+		ttl, err := syncer.client.PTTL(t.Context(), syncer.setKey("prefix", "0")).Result()
+		require.NoError(t, err)
+		require.Greater(t, ttl, 50*time.Second, "every set has an expiration")
+
+		require.NoError(t, syncer.RemoveFromSets(t.Context(), "prefix", ids, "e1"))
+		sets, err = syncer.LoadSets(t.Context(), "prefix", ids)
+		require.NoError(t, err)
+		require.Equal(t, []string{"e2"}, sets[0])
+		require.Empty(t, sets[63])
+	})
 }
 
 // forEachNode runs fn on every master of a cluster client, or on the client
