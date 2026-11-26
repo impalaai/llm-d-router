@@ -247,6 +247,18 @@ func TestFactoryRejectsDBInClusterMode(t *testing.T) {
 	require.Nil(t, plugin)
 }
 
+func TestFactoryConnectsBeforeTheFirstCall(t *testing.T) {
+	for _, cluster := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cluster=%t", cluster), func(t *testing.T) {
+			server := miniredis.RunT(t)
+			newSyncerFromParams(t, fmt.Sprintf(`{"address": %q, "cluster": %t}`, server.Addr(), cluster))
+
+			require.Eventually(t, func() bool { return server.CurrentConnectionCount() >= idleConnections },
+				5*time.Second, 10*time.Millisecond, "connections open before the first call")
+		})
+	}
+}
+
 func newSyncerFromParams(t *testing.T, params string) *RedisSyncer {
 	t.Helper()
 	plugin, err := RedisSyncerFactory("redis", json.NewDecoder(strings.NewReader(params)), nil)

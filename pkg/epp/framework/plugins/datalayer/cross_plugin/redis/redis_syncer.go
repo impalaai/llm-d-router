@@ -46,6 +46,11 @@ const (
 	defaultCoordinationTTL = 180 * time.Second
 	batchSize              = 100
 	batchConcurrency       = 8
+	// idleConnections is how many idle connections the client keeps open to
+	// each Redis node. Opening a TLS connection takes tens of milliseconds,
+	// longer than a call on the request path may wait.
+	idleConnections = 16
+	connectTimeout  = 10 * time.Second
 )
 
 var _ fwkdl.CrossReplicaSyncer = (*RedisSyncer)(nil)
@@ -191,6 +196,7 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 			Password:              password,
 			TLSConfig:             tlsCfg,
 			ContextTimeoutEnabled: true,
+			MinIdleConns:          idleConnections,
 		})
 	} else {
 		client = goredis.NewClient(&goredis.Options{
@@ -199,11 +205,21 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 			DB:                    cfg.DB,
 			TLSConfig:             tlsCfg,
 			ContextTimeoutEnabled: true,
+			MinIdleConns:          idleConnections,
 		})
 	}
+	ctx := context.Background()
 	if handle != nil && handle.Context() != nil {
-		context.AfterFunc(handle.Context(), func() { _ = client.Close() })
+		ctx = handle.Context()
+		context.AfterFunc(ctx, func() { _ = client.Close() })
 	}
+	go func() {
+		connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+		defer cancel()
+		if err := connect(connectCtx, client); err != nil && ctx.Err() == nil && !errors.Is(err, goredis.ErrClosed) {
+			ctrl.LoggerFrom(ctx).Error(err, "redis-syncer: connecting before the first call failed", "plugin", name)
+		}
+	}()
 
 	return &RedisSyncer{
 		typedName:       fwkplugin.TypedName{Type: RedisSyncerType, Name: name},
@@ -213,6 +229,18 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 		stateTTL:        stateTTL,
 		coordinationTTL: coordinationTTL,
 	}, nil
+}
+
+// connect pings every primary. A cluster client loads the shard map and
+// creates the connection pool of each node on its first call, and a pool opens
+// its idle connections when it is created.
+func connect(ctx context.Context, client goredis.UniversalClient) error {
+	if cluster, ok := client.(*goredis.ClusterClient); ok {
+		return cluster.ForEachMaster(ctx, func(ctx context.Context, node *goredis.Client) error {
+			return node.Ping(ctx).Err()
+		})
+	}
+	return client.Ping(ctx).Err()
 }
 
 func (s *RedisSyncer) TypedName() fwkplugin.TypedName {
