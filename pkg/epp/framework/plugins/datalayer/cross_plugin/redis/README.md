@@ -164,8 +164,11 @@ capacity across different requests.
 ## Deployment
 
 The plugin is a Redis client and does not deploy a Redis server. The server must
-be provisioned separately. Plugin construction does not connect to Redis, so an
-unavailable server does not prevent the EPP from starting. Failed publications
+be provisioned separately. Plugin construction connects to Redis in the
+background and does not wait for it, so an unavailable server does not prevent
+the EPP from starting; a failed attempt is logged at error level. The client
+keeps 16 idle connections open to every Redis node, so the first calls on the
+request path do not wait for new TLS connections. Failed publications
 are logged at error level with rate limiting and leave the peer cache unchanged,
 so scheduling keeps counting the last known peer state until a publication
 succeeds. A peer that stops while Redis is unreachable keeps counting until
