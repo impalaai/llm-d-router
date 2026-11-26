@@ -82,6 +82,7 @@ func (p *parameters) validate() error {
 var _ scheduling.Scorer = &SessionAffinity{}
 var _ fwkrh.ResponseHeaderProcessor = &SessionAffinity{}
 var _ fwkrh.PreRequest = &SessionAffinity{}
+var _ fwkrh.TargetReviser = &SessionAffinity{}
 
 func Factory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
 	params := defaultParameters()
@@ -98,9 +99,10 @@ func Factory(name string, rawParameters *json.Decoder, handle plugin.Handle) (pl
 		return nil, fmt.Errorf("invalid profileName of the '%s' scorer - %w", SessionAffinityType, err)
 	}
 
+	typedName := plugin.TypedName{Type: SessionAffinityType, Name: name}
 	return &SessionAffinity{
-		typedName: plugin.TypedName{Type: SessionAffinityType, Name: name},
-		strategy:  newStrategy(params, handle),
+		typedName: typedName,
+		strategy:  newStrategy(typedName, params, handle),
 	}, nil
 }
 
@@ -128,9 +130,9 @@ type strategy interface {
 	responseHeader(ctx context.Context, request *scheduling.InferenceRequest, response *fwkrh.Response, targetPod *datalayer.EndpointMetadata)
 }
 
-func newStrategy(params parameters, handle plugin.Handle) strategy {
+func newStrategy(typedName plugin.TypedName, params parameters, handle plugin.Handle) strategy {
 	if params.Strategy == StrategySessionID {
-		return newSessionIDHeaderStrategy(params, handle)
+		return newSessionIDHeaderStrategy(typedName, params, handle)
 	}
 	return newEncodedEndpointHeaderStrategy(params)
 }
@@ -153,6 +155,19 @@ func (s *SessionAffinity) Consumes() plugin.DataDependencies {
 
 func (s *SessionAffinity) Category() scheduling.ScorerCategory {
 	return scheduling.Affinity
+}
+
+// ReviseTargets lets a strategy that shares its bindings across EPP replicas
+// route the request to the pod another replica bound the session to.
+func (s *SessionAffinity) ReviseTargets(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
+	if reviser, ok := s.strategy.(targetReviser); ok {
+		reviser.ReviseTargets(ctx, request, schedulingResult)
+	}
+}
+
+// targetReviser is implemented by strategies that revise scheduled targets.
+type targetReviser interface {
+	ReviseTargets(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult)
 }
 
 func (s *SessionAffinity) Score(ctx context.Context, request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {

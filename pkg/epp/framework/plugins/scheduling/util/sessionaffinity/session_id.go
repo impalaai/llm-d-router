@@ -49,6 +49,14 @@ type SessionIDConfig struct {
 	EvictionTTLSeconds float64 `json:"evictionTtlSeconds"`
 	// EvictionSweepSeconds is how often expired bindings are swept.
 	EvictionSweepSeconds float64 `json:"evictionSweepSeconds"`
+	// SyncCrossReplicaState controls whether session bindings are shared
+	// across EPP replicas when the configured cross-replica syncer stores
+	// per-key values. Unset defaults to true; set false to keep bindings local
+	// to this replica.
+	SyncCrossReplicaState *bool `json:"syncCrossReplicaState,omitempty"`
+	// StoreTimeoutSeconds bounds each shared-store call. A request makes at
+	// most one read and one write. 0 defaults to defaultStoreTimeoutSeconds.
+	StoreTimeoutSeconds float64 `json:"storeTimeoutSeconds,omitempty"`
 }
 
 // SessionIDSource names one place a session identifier can be read from.
@@ -98,7 +106,13 @@ func (c *SessionIDConfig) Validate() error {
 	if err := duration.ValidateSeconds("evictionTtlSeconds", c.EvictionTTLSeconds); err != nil {
 		return err
 	}
-	return duration.ValidateSeconds("evictionSweepSeconds", c.EvictionSweepSeconds)
+	if err := duration.ValidateSeconds("evictionSweepSeconds", c.EvictionSweepSeconds); err != nil {
+		return err
+	}
+	if c.StoreTimeoutSeconds == 0 {
+		return nil
+	}
+	return duration.ValidateSeconds("storeTimeoutSeconds", c.StoreTimeoutSeconds)
 }
 
 // ValidateSources rejects a source that does not set exactly one of Header or
@@ -126,6 +140,10 @@ func (s SessionIDSource) validate() error {
 // session whose bound pod is absent rebinds to the pod the request was routed
 // to.
 //
+// With a cross-replica syncer that stores per-key values, each binding is also
+// one key in that store, read on every request. The stored binding overrides
+// the local one, and the local one answers when the store does not.
+//
 // It is the shared implementation behind the session-affinity scorer and
 // filter: Choose resolves the target endpoint, PreRequest commits the binding,
 // ResponseHeader is a no-op. Each plugin embeds it and adds only its own output
@@ -133,16 +151,25 @@ func (s SessionIDSource) validate() error {
 type SessionIDHeader struct {
 	sources     []SessionIDSource
 	profileName string
+	// typedName is the owning scorer/filter's identity. Its name namespaces
+	// the shared bindings.
+	typedName plugin.TypedName
 	// pluginKey keys the Choose->PreRequest presence handoff and labels the
-	// plugin in logs; the owning scorer/filter passes its own plugin type.
+	// plugin in logs; it is the owning scorer/filter's plugin type.
 	pluginKey     plugin.StateKey
 	ttl           time.Duration
 	sweepInterval time.Duration
-	// mu serializes each bind/migrate/evict sequence so a first-bind cannot race
-	// a concurrent sweep and leave the binding store inconsistent.
+	// mu serializes each bind/migrate/adopt/evict sequence so a first-bind
+	// cannot race a concurrent sweep and leave the binding store inconsistent.
 	mu          sync.Mutex
 	bindings    sync.Map // session identifier -> binding
 	pluginState *plugin.PluginState
+	handle      plugin.Handle
+
+	syncCrossReplicaState bool
+	storeTimeout          time.Duration
+	pinStateKey           datalayer.StateKey
+	warnNoStore           sync.Once
 }
 
 // Consumes declares the request attributes the configured sources read. They
@@ -178,23 +205,50 @@ func SourcesConsumes(sources []SessionIDSource) plugin.DataDependencies {
 type boundPodPresence struct {
 	podName string
 	present bool
+	// shared reports that Choose read the shared store, and sharedPod is the
+	// pod it held for the session, or "" when it held none.
+	shared    bool
+	sharedPod string
+	// settled reports that ReviseTargets settled the shared pin for this
+	// request, and settledPod is the pod it is pinned to.
+	settled    bool
+	settledPod string
 }
 
 func (b *boundPodPresence) Clone() plugin.StateData {
-	return &boundPodPresence{podName: b.podName, present: b.present}
+	clone := *b
+	return &clone
 }
 
 // NewSessionIDHeader builds the shared session_id strategy implementation and
-// starts its eviction sweep for the plugin's lifetime. pluginKey is the owning
-// plugin's type, used for the PluginState handoff key and log labels.
-func NewSessionIDHeader(config SessionIDConfig, profileName string, pluginKey plugin.StateKey, handle plugin.Handle) *SessionIDHeader {
+// starts its eviction sweep for the plugin's lifetime. typedName is the owning
+// plugin's identity.
+func NewSessionIDHeader(config SessionIDConfig, profileName string, typedName plugin.TypedName, handle plugin.Handle) *SessionIDHeader {
+	syncCrossReplicaState := true
+	if config.SyncCrossReplicaState != nil {
+		syncCrossReplicaState = *config.SyncCrossReplicaState
+	}
+	storeTimeoutSeconds := config.StoreTimeoutSeconds
+	if storeTimeoutSeconds == 0 {
+		storeTimeoutSeconds = defaultStoreTimeoutSeconds
+	}
 	s := &SessionIDHeader{
-		sources:       config.Sources,
-		profileName:   profileName,
-		pluginKey:     pluginKey,
-		ttl:           time.Duration(config.EvictionTTLSeconds * float64(time.Second)),
-		sweepInterval: time.Duration(config.EvictionSweepSeconds * float64(time.Second)),
-		pluginState:   plugin.NewPluginState(handle.Context()),
+		sources:               config.Sources,
+		profileName:           profileName,
+		typedName:             typedName,
+		pluginKey:             plugin.StateKey(typedName.Type),
+		ttl:                   time.Duration(config.EvictionTTLSeconds * float64(time.Second)),
+		sweepInterval:         time.Duration(config.EvictionSweepSeconds * float64(time.Second)),
+		pluginState:           plugin.NewPluginState(handle.Context()),
+		handle:                handle,
+		syncCrossReplicaState: syncCrossReplicaState,
+		storeTimeout:          time.Duration(storeTimeoutSeconds * float64(time.Second)),
+		pinStateKey:           datalayer.StateKey("session-affinity:" + typedName.Name),
+	}
+	if recorder := handle.Metrics(); recorder != nil {
+		if err := registerMetrics(recorder); err != nil {
+			log.FromContext(handle.Context()).Error(err, "Session affinity - shared pin metrics are not exported", "plugin", typedName.String())
+		}
 	}
 	go s.runEviction(handle.Context(), s.sweepInterval)
 	return s
@@ -264,8 +318,8 @@ func attributeString(ctx context.Context, request *scheduling.InferenceRequest, 
 // session identifier, the session is unbound, or its bound pod is absent from
 // the candidate set: in each case the session expresses no usable preference
 // and the consumer decides. It returns (pod, true) only for a session bound to
-// a present candidate. Choose does not mutate the store; the binding is
-// committed in PreRequest.
+// a present candidate. A binding held in the shared store replaces the local
+// one first; the request's own binding is committed in PreRequest.
 func (s *SessionIDHeader) Choose(ctx context.Context, request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) (scheduling.Endpoint, bool) {
 	if len(endpoints) == 0 {
 		return nil, false
@@ -276,6 +330,11 @@ func (s *SessionIDHeader) Choose(ctx context.Context, request *scheduling.Infere
 		return nil, false
 	}
 
+	sharedPod, shared := s.loadSharedPin(ctx, sessionID)
+	if sharedPod != "" {
+		s.bindLocal(sessionID, sharedPod)
+	}
+
 	podName := s.boundPod(sessionID)
 	var target scheduling.Endpoint
 	for _, endpoint := range endpoints {
@@ -284,8 +343,10 @@ func (s *SessionIDHeader) Choose(ctx context.Context, request *scheduling.Infere
 		}
 	}
 
-	if podName != "" {
-		s.pluginState.Write(request.RequestID, s.pluginKey, &boundPodPresence{podName: podName, present: target != nil})
+	if podName != "" || shared {
+		s.pluginState.Write(request.RequestID, s.pluginKey, &boundPodPresence{
+			podName: podName, present: target != nil, shared: shared, sharedPod: sharedPod,
+		})
 	}
 
 	if target == nil {
@@ -311,8 +372,9 @@ func (s *SessionIDHeader) boundPod(sessionID string) string {
 	return b.podName
 }
 
-// PreRequest is the only place bindings are mutated. A session migrates only
-// when its bound pod is absent from the candidate set.
+// PreRequest commits the binding of a routed request. A session migrates only
+// when its bound pod is absent from the candidate set. It settles the shared
+// pin itself when ReviseTargets did not run for the request.
 func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
 	sessionID := s.resolveSessionID(ctx, request)
 	if sessionID == "" {
@@ -321,6 +383,21 @@ func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.In
 	podName := s.pickedPodName(schedulingResult)
 	if podName == "" {
 		return
+	}
+
+	present, err := plugin.ReadPluginStateKey[*boundPodPresence](s.pluginState, request.RequestID, s.pluginKey)
+	if err != nil {
+		present = nil
+	}
+	if present != nil && present.settled {
+		s.bindLocal(sessionID, present.settledPod)
+		return
+	}
+	if present != nil && present.shared {
+		if pinned, ok := s.commitSharedPin(ctx, sessionID, podName, present); ok {
+			s.bindLocal(sessionID, pinned)
+			return
+		}
 	}
 
 	s.mu.Lock()
@@ -348,8 +425,7 @@ func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.In
 	// this request's own Choose call. A missing record (e.g. a concurrent
 	// first-bind race) is not treated as absence, and neither is a record about
 	// a pod a concurrent request has already migrated the session away from.
-	present, err := plugin.ReadPluginStateKey[*boundPodPresence](s.pluginState, request.RequestID, s.pluginKey)
-	if err != nil || present == nil || present.present || present.podName != existing.podName {
+	if present == nil || present.present || present.podName != existing.podName {
 		return
 	}
 
@@ -364,21 +440,27 @@ func (s *SessionIDHeader) PreRequest(ctx context.Context, request *scheduling.In
 // that profile was not scheduled. An empty profileName selects the primary
 // (decode) profile.
 func (s *SessionIDHeader) pickedPodName(schedulingResult *scheduling.SchedulingResult) string {
-	if schedulingResult == nil {
-		return ""
-	}
-	profileName := s.profileName
-	if profileName == "" {
-		profileName = schedulingResult.PrimaryProfileName
-	}
-	result, ok := schedulingResult.ProfileResults[profileName]
-	if !ok || result == nil || len(result.TargetEndpoints) == 0 || result.TargetEndpoints[0] == nil {
+	result := s.profileResult(schedulingResult)
+	if result == nil || len(result.TargetEndpoints) == 0 || result.TargetEndpoints[0] == nil {
 		return ""
 	}
 	if md := result.TargetEndpoints[0].GetMetadata(); md != nil {
 		return md.ID.String()
 	}
 	return ""
+}
+
+// profileResult returns the result of this instance's profile, or nil when
+// that profile was not scheduled.
+func (s *SessionIDHeader) profileResult(schedulingResult *scheduling.SchedulingResult) *scheduling.ProfileRunResult {
+	if schedulingResult == nil {
+		return nil
+	}
+	profileName := s.profileName
+	if profileName == "" {
+		profileName = schedulingResult.PrimaryProfileName
+	}
+	return schedulingResult.ProfileResults[profileName]
 }
 
 // ResponseHeader is a no-op: under session_id the client owns its

@@ -739,6 +739,23 @@ which startup accepts because the dependency is optional.
 `self` and `below-floor` occur whether or not the selected endpoint is in the filter's sticky set,
 so `p2p_outcome` does not show whether a `load_override` moved the request off it.
 
+### Session affinity shared pins
+
+The `session_id` strategy of `session-affinity-scorer` and `session-affinity-filter` emits these when
+it shares its bindings through a cross-replica syncer that stores per-key values; see
+[Multiple EPP replicas](../pkg/epp/framework/plugins/scheduling/scorer/sessionaffinity/README.md#multiple-epp-replicas).
+
+| Full metric name | Type | Labels | Notes |
+|---|---|---|---|
+| `llm_d_epp_session_affinity_shared_pin_total` | Counter | `plugin_name`, `plugin_type`, `result` | Outcomes of the shared pin calls. |
+| `llm_d_epp_session_affinity_shared_pin_call_duration_seconds` | Histogram | `plugin_name`, `plugin_type`, `operation` | Duration of each store call. `operation` is `read`, `create` or `move`. |
+
+`result` values: `hit` and `miss` for a read that found a pin or none; `created` and `create_lost`
+for a new session's pin this replica stored, or that another replica stored first; `moved` and
+`move_lost` for a pin moved off a pod that left the candidates, by this replica or by another first;
+`redirected` for a request routed to the pod another replica pinned; `error` for a store call that
+failed or timed out, after which the request used the local binding.
+
 ### Token producer render
 
 These metrics belong to the `token-producer` when it uses the vLLM render backend. The metric

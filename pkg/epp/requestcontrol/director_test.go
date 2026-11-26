@@ -3662,3 +3662,68 @@ func TestDirector_HandleResponseBody_LifecycleTimestamps(t *testing.T) {
 	assert.Equal(t, reqCtx.ResponseCompleteTimestamp(), resp.CompleteTimestamp)
 	assert.Equal(t, reqCtx.ModelServerStreaming(), resp.Streaming)
 }
+
+// mockTargetReviser replaces the primary profile's targets with endpoint.
+type mockTargetReviser struct {
+	endpoint fwksched.Endpoint
+}
+
+func (m *mockTargetReviser) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Name: "reviser", Type: "mock"}
+}
+
+func (m *mockTargetReviser) ReviseTargets(_ context.Context, _ *fwksched.InferenceRequest, result *fwksched.SchedulingResult) {
+	result.ProfileResults[result.PrimaryProfileName].TargetEndpoints = []fwksched.Endpoint{m.endpoint}
+}
+
+// TestPrepareRequest_TargetRevisersRunBeforeTheTargetIsRead verifies that the
+// request is sent to the endpoint a TargetReviser put in the result, and that
+// PreRequest plugins see that result.
+func TestPrepareRequest_TargetRevisersRunBeforeTheTargetIsRead(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	endpoint := func(name, ip string) fwksched.Endpoint {
+		return fwksched.NewEndpoint(&fwkdl.EndpointMetadata{
+			ID:      types.NamespacedName{Namespace: "default", Name: name},
+			Address: ip,
+			Port:    "8000",
+		}, &fwkdl.Metrics{}, nil)
+	}
+	picked, revised := endpoint("picked", "10.0.0.1"), endpoint("revised", "10.0.0.2")
+	result := &fwksched.SchedulingResult{
+		PrimaryProfileName: "default",
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			"default": {TargetEndpoints: []fwksched.Endpoint{picked}},
+		},
+	}
+
+	var seenByPreRequest string
+	preRequest := &resultRecordingPreRequest{seen: &seenByPreRequest}
+	config := NewConfig()
+	config.AddPlugins(&mockTargetReviser{endpoint: revised}, preRequest)
+	dir := &Director{requestControlPlugins: *config}
+	reqCtx := &handlers.RequestContext{
+		Request:           &handlers.Request{Headers: map[string]string{}},
+		SchedulingRequest: &fwksched.InferenceRequest{RequestID: "req-revised", Headers: map[string]string{}},
+	}
+
+	reqCtx, err := dir.prepareRequest(ctx, reqCtx, result)
+
+	require.NoError(t, err)
+	assert.Equal(t, "revised", reqCtx.TargetPod.ID.Name)
+	assert.Equal(t, "10.0.0.2:8000", reqCtx.TargetEndpoint)
+	assert.Equal(t, "revised", seenByPreRequest)
+}
+
+// resultRecordingPreRequest records the primary target it is called with.
+type resultRecordingPreRequest struct {
+	seen *string
+}
+
+func (r *resultRecordingPreRequest) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Name: "recorder", Type: "mock"}
+}
+
+func (r *resultRecordingPreRequest) PreRequest(_ context.Context, _ *fwksched.InferenceRequest, result *fwksched.SchedulingResult) error {
+	*r.seen = result.ProfileResults[result.PrimaryProfileName].TargetEndpoints[0].GetMetadata().ID.Name
+	return nil
+}

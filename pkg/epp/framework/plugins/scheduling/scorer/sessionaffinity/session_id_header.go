@@ -33,11 +33,10 @@ type sessionIDHeaderStrategy struct {
 	*sessionutil.SessionIDHeader
 }
 
-func newSessionIDHeaderStrategy(params parameters, handle plugin.Handle) strategy {
+func newSessionIDHeaderStrategy(typedName plugin.TypedName, params parameters, handle plugin.Handle) strategy {
 	return &sessionIDHeaderStrategy{
 		SessionIDHeader: sessionutil.NewSessionIDHeader(
-			params.SessionIDConfig, params.ProfileName,
-			plugin.StateKey(SessionAffinityType), handle,
+			params.SessionIDConfig, params.ProfileName, typedName, handle,
 		),
 	}
 }

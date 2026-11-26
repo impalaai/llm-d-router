@@ -32,9 +32,9 @@ import (
 	"github.com/llm-d/llm-d-router/test/utils"
 )
 
-// testPluginKey is the owning-plugin identity a test SessionIDHeader is built
-// with; any stable string works since it only keys per-instance state.
-const testPluginKey = plugin.StateKey("session-affinity-test")
+// testTypedName is the owning-plugin identity a test SessionIDHeader is built
+// with; any stable identity works since it only keys per-instance state.
+var testTypedName = plugin.TypedName{Type: "session-affinity-test", Name: "test"}
 
 // testOptions overrides the defaults a test SessionIDHeader is built with.
 type testOptions struct {
@@ -54,7 +54,7 @@ func newTestSessionIDHeader(t *testing.T, overrides func(*testOptions)) *Session
 		EvictionSweepSeconds: 10,
 	}
 	return NewSessionIDHeader(
-		config, opts.profileName, testPluginKey,
+		config, opts.profileName, testTypedName,
 		utils.NewTestHandle(utils.NewTestContext(t)),
 	)
 }
@@ -415,7 +415,7 @@ func headerWithSources(t *testing.T, sources ...SessionIDSource) *SessionIDHeade
 	t.Helper()
 	return NewSessionIDHeader(
 		SessionIDConfig{Sources: sources, EvictionTTLSeconds: 300, EvictionSweepSeconds: 10},
-		"", testPluginKey, utils.NewTestHandle(utils.NewTestContext(t)),
+		"", testTypedName, utils.NewTestHandle(utils.NewTestContext(t)),
 	)
 }
 
@@ -700,7 +700,7 @@ func TestSessionIDHeader_Consumes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := NewSessionIDHeader(
 				SessionIDConfig{Sources: tt.sources, EvictionTTLSeconds: 300, EvictionSweepSeconds: 10},
-				"", testPluginKey, handle,
+				"", testTypedName, handle,
 			)
 
 			consumes := s.Consumes()

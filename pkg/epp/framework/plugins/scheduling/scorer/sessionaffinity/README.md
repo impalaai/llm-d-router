@@ -31,6 +31,8 @@ Supports two algorithms, selected by the `strategy` parameter:
 | `sources` | list | one `header` source `x-session-id` | Where the session identifier is read from, in priority order; the first non-empty match wins. Each source sets exactly one of `header` (a request header name) or `attribute` (a request-attribute key published by an upstream plugin). |
 | `evictionTtlSeconds` | float | `300` | How long a session binding survives unused. |
 | `evictionSweepSeconds` | float | `10` | How often expired bindings are swept. |
+| `syncCrossReplicaState` | bool | `true` | Share session bindings with other EPP replicas when the configured cross-replica syncer stores per-key values; see [Multiple EPP replicas](#multiple-epp-replicas). |
+| `storeTimeoutSeconds` | float | `0.1` | Time limit for each shared-store call. A request makes at most one read and one write; see [Multiple EPP replicas](#multiple-epp-replicas). |
 
 ### Default Configuration (without PD disaggregation)
 
@@ -85,6 +87,24 @@ To support session affinity with PD disaggregation, configure two separate insta
 ```
 
 The decode instance uses the default behavior (writing the decode pod to `x-session-token`). The prefill instance uses `profileName: prefill` to look up the prefill pod from the scheduling results and write it to `x-session-token-prefill`. This ensures that subsequent requests in the same session target both the same prefill pod and the same decode pod. `session_id` supports the same pattern: configure one instance per profile, each with its own `profileName`.
+
+## Multiple EPP replicas
+
+`session_id` bindings are shared between EPP replicas when `syncCrossReplicaState` is `true` and the configured cross-replica syncer (`dataLayer.crossReplica`) stores per-key values. `redis-syncer` does; see its [Value Store](../../../datalayer/cross_plugin/redis/README.md#value-store). With any other syncer, or none, bindings stay local to each replica.
+
+Each binding is one key in the store, named by the 64-bit xxhash of the session identifier and holding the endpoint ID. Session identifiers themselves are not stored. The key expires `evictionTtlSeconds` after its last use.
+
+For each request that carries a session identifier:
+
+1. The plugin reads the key, which also resets its expiration. A stored binding replaces the replica's local one.
+2. A session with no stored binding is scheduled normally. The replica then stores the binding unless another replica stored one first, and uses the stored one.
+3. A stored binding whose pod is not among the request's candidates is replaced with the routed pod, unless another replica replaced it first.
+
+A known session costs one store call per request and a new session two. A replica that starts with an empty local map finds existing bindings in the store.
+
+The replica stores or replaces the binding after scheduling and before it routes the request. When another replica stored a different pod first, the request is routed to that pod if the scheduling profile scored it, and to the pod this replica picked otherwise.
+
+When a store call fails or takes longer than `storeTimeoutSeconds`, the replica routes on its local binding, or schedules normally when it has none. A local binding is stored again on the next request the store answers and holds no binding for.
 
 ## Relationship to the session affinity filter
 

@@ -24,6 +24,7 @@ import (
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	sessionutil "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/util/sessionaffinity"
 	"github.com/llm-d/llm-d-router/test/utils"
@@ -31,7 +32,7 @@ import (
 
 func newTestFilterStrategy(t *testing.T) *sessionIDHeaderStrategy {
 	t.Helper()
-	built := newSessionIDHeaderStrategy(parameters{
+	built := newSessionIDHeaderStrategy(plugin.TypedName{Type: SessionAffinityType, Name: "test"}, parameters{
 		Strategy: StrategySessionID,
 		SessionIDConfig: sessionutil.SessionIDConfig{
 			Sources:              []sessionutil.SessionIDSource{{Header: sessionutil.DefaultHeader}},
