@@ -474,3 +474,27 @@ func TestSetBatchConcurrentChunksBoundWorkAfterCancellation(t *testing.T) {
 	require.Equal(t, int64(batchConcurrency), calls.Load())
 	require.Equal(t, int64(batchConcurrency*batchSize), reads.Load())
 }
+
+func TestSetBatchInClusterMode(t *testing.T) {
+	server := miniredis.RunT(t)
+	syncer := newSyncerFromParams(t, fmt.Sprintf(`{"address": %q, "cluster": true}`, server.Addr()))
+	syncer.client.AddHook(&miniredisHExpireCompatibilityHook{})
+	spec := batchIntSpec()
+	ids := batchEndpointIDs(batchSize + 5)
+	peerValue, err := crossreplica.EncodeValue(cloneableInt(7))
+	require.NoError(t, err)
+	server.HSet(syncer.hashKey(spec.StateKey, ids[0]), "epp-peer", string(peerValue))
+
+	require.Empty(t, syncer.SetBatch(t.Context(), spec, ids, time.Second))
+
+	for i, id := range ids {
+		require.NotEmpty(t, server.HGet(syncer.hashKey(spec.StateKey, id), syncer.replicaID), id)
+		want := cloneableInt(4)
+		if i == 0 {
+			want = 11
+		}
+		got, _, err := syncer.Get(t.Context(), spec, id)
+		require.NoError(t, err)
+		require.Equal(t, want, got, id)
+	}
+}

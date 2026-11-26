@@ -18,6 +18,8 @@ package redis
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,19 +46,35 @@ const (
 	defaultCoordinationTTL = 180 * time.Second
 	batchSize              = 100
 	batchConcurrency       = 8
+	// idleConnections is how many idle connections the client keeps open to
+	// each Redis node. Opening a TLS connection takes tens of milliseconds,
+	// longer than a call on the request path may wait.
+	idleConnections = 16
+	connectTimeout  = 10 * time.Second
 )
 
 var _ fwkdl.CrossReplicaSyncer = (*RedisSyncer)(nil)
 var _ fwkdl.CrossReplicaBatchSyncer = (*RedisSyncer)(nil)
 
 type redisConfig struct {
-	Address         string `json:"address"`
-	Password        string `json:"password"`
-	PasswordEnv     string `json:"passwordEnv"`
-	PasswordFile    string `json:"passwordFile"`
-	DB              int    `json:"db"`
-	StateTTL        string `json:"stateTTL"`
-	CoordinationTTL string `json:"coordinationTTL"`
+	Address         string     `json:"address"`
+	Password        string     `json:"password"`
+	PasswordEnv     string     `json:"passwordEnv"`
+	PasswordFile    string     `json:"passwordFile"`
+	DB              int        `json:"db"`
+	StateTTL        string     `json:"stateTTL"`
+	CoordinationTTL string     `json:"coordinationTTL"`
+	TLS             *tlsConfig `json:"tls"`
+	Cluster         bool       `json:"cluster"`
+	KeyPrefix       string     `json:"keyPrefix"`
+}
+
+// tlsConfig turns on TLS when present, even when empty.
+type tlsConfig struct {
+	// CAFile is a PEM bundle that replaces the system roots.
+	CAFile string `json:"caFile"`
+	// ServerName overrides the name verified in every server certificate.
+	ServerName string `json:"serverName"`
 }
 
 // RedisSyncer is a CrossReplicaSyncer backed by Redis for cross-replica
@@ -66,7 +84,8 @@ type redisConfig struct {
 type RedisSyncer struct {
 	typedName       fwkplugin.TypedName
 	replicaID       string
-	client          *goredis.Client
+	client          goredis.UniversalClient
+	keyPrefix       string
 	stateTTL        time.Duration
 	coordinationTTL time.Duration
 	cache           sync.Map
@@ -114,6 +133,22 @@ func resolvePassword(cfg redisConfig) (string, error) {
 	return "", nil
 }
 
+func buildTLSConfig(cfg *tlsConfig) (*tls.Config, error) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: cfg.ServerName}
+	if cfg.CAFile != "" {
+		pem, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("redis-syncer: read tls caFile %q: %w", cfg.CAFile, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("redis-syncer: tls caFile %q contains no certificates", cfg.CAFile)
+		}
+		tlsCfg.RootCAs = pool
+	}
+	return tlsCfg, nil
+}
+
 func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	var cfg redisConfig
 	if params != nil {
@@ -124,6 +159,9 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 	}
 	if cfg.Address == "" {
 		cfg.Address = defaultAddress
+	}
+	if cfg.Cluster && cfg.DB != 0 {
+		return nil, fmt.Errorf("redis-syncer: db must be 0 in cluster mode, got %d", cfg.DB)
 	}
 
 	stateTTL, err := parseTTL("stateTTL", cfg.StateTTL, crossreplica.DefaultStateTTL)
@@ -138,42 +176,94 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 	if err != nil {
 		return nil, err
 	}
+	// A nil TLS config keeps the connection on plain TCP.
+	var tlsCfg *tls.Config
+	if cfg.TLS != nil {
+		if tlsCfg, err = buildTLSConfig(cfg.TLS); err != nil {
+			return nil, err
+		}
+	}
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "unknown"
 	}
 	replicaID := hostname + "-" + uuid.NewString()
 
-	client := goredis.NewClient(&goredis.Options{
-		Addr:                  cfg.Address,
-		Password:              password,
-		DB:                    cfg.DB,
-		ContextTimeoutEnabled: true,
-	})
-	if handle != nil && handle.Context() != nil {
-		context.AfterFunc(handle.Context(), func() { _ = client.Close() })
+	var client goredis.UniversalClient
+	if cfg.Cluster {
+		client = goredis.NewClusterClient(&goredis.ClusterOptions{
+			Addrs:                 []string{cfg.Address},
+			Password:              password,
+			TLSConfig:             tlsCfg,
+			ContextTimeoutEnabled: true,
+			MinIdleConns:          idleConnections,
+		})
+	} else {
+		client = goredis.NewClient(&goredis.Options{
+			Addr:                  cfg.Address,
+			Password:              password,
+			DB:                    cfg.DB,
+			TLSConfig:             tlsCfg,
+			ContextTimeoutEnabled: true,
+			MinIdleConns:          idleConnections,
+		})
 	}
+	ctx := context.Background()
+	if handle != nil && handle.Context() != nil {
+		ctx = handle.Context()
+		context.AfterFunc(ctx, func() { _ = client.Close() })
+	}
+	go func() {
+		connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+		defer cancel()
+		if err := connect(connectCtx, client); err != nil && ctx.Err() == nil && !errors.Is(err, goredis.ErrClosed) {
+			ctrl.LoggerFrom(ctx).Error(err, "redis-syncer: connecting before the first call failed", "plugin", name)
+		}
+	}()
 
 	return &RedisSyncer{
 		typedName:       fwkplugin.TypedName{Type: RedisSyncerType, Name: name},
 		replicaID:       replicaID,
 		client:          client,
+		keyPrefix:       cfg.KeyPrefix,
 		stateTTL:        stateTTL,
 		coordinationTTL: coordinationTTL,
 	}, nil
+}
+
+// connect pings every primary. A cluster client loads the shard map and
+// creates the connection pool of each node on its first call, and a pool opens
+// its idle connections when it is created.
+func connect(ctx context.Context, client goredis.UniversalClient) error {
+	if cluster, ok := client.(*goredis.ClusterClient); ok {
+		return cluster.ForEachMaster(ctx, func(ctx context.Context, node *goredis.Client) error {
+			return node.Ping(ctx).Err()
+		})
+	}
+	return client.Ping(ctx).Err()
 }
 
 func (s *RedisSyncer) TypedName() fwkplugin.TypedName {
 	return s.typedName
 }
 
+// key joins parts with ":" under the configured key prefix, so every key the
+// syncer touches lives in the prefix's namespace.
+func (s *RedisSyncer) key(parts ...string) string {
+	key := strings.Join(parts, ":")
+	if s.keyPrefix == "" {
+		return key
+	}
+	return s.keyPrefix + ":" + key
+}
+
 func (s *RedisSyncer) hashKey(key fwkdl.StateKey, endpointID string) string {
-	return string(key) + ":" + endpointID
+	return s.key(string(key), endpointID)
 }
 
 // coordKey namespaces request-level values away from endpoint hashes.
 func (s *RedisSyncer) coordKey(key fwkdl.StateKey, id string) string {
-	return "coord:" + string(key) + ":" + id
+	return s.key("coord", string(key), id)
 }
 
 // set publishes this replica's value and prepares the peer aggregate returned
@@ -282,6 +372,16 @@ func (s *RedisSyncer) setBatchChunk(ctx context.Context, spec fwkdl.CrossReplica
 	if err := ctx.Err(); err != nil {
 		for _, endpointID := range chunk {
 			failures[endpointID] = err
+		}
+		return failures
+	}
+	if _, ok := s.client.(*goredis.ClusterClient); ok {
+		// A cluster transaction is limited to one hash slot, and each endpoint
+		// hash has its own.
+		for _, endpointID := range chunk {
+			if err := s.Set(ctx, spec, endpointID); err != nil {
+				failures[endpointID] = err
+			}
 		}
 		return failures
 	}
