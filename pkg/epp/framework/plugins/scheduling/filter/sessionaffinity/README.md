@@ -34,7 +34,7 @@ Supports two algorithms, selected by the `strategy` parameter:
 | `evictionTtlSeconds` | float | `300` | How long a session binding survives unused. |
 | `evictionSweepSeconds` | float | `10` | How often expired bindings are swept. |
 | `syncCrossReplicaState` | bool | `true` | Share session bindings with other EPP replicas when the configured cross-replica syncer stores per-key values; see [Multiple EPP replicas](#multiple-epp-replicas). |
-| `storeTimeoutSeconds` | float | `0.05` | Time limit for each shared-store call. A request makes at most one read and one write; see [Multiple EPP replicas](#multiple-epp-replicas). |
+| `storeTimeoutSeconds` | float | `0.1` | Time limit for each shared-store call. A request makes at most one read and one write; see [Multiple EPP replicas](#multiple-epp-replicas). |
 
 ### Default Configuration (without PD disaggregation)
 

@@ -31,7 +31,7 @@ import (
 )
 
 // defaultStoreTimeoutSeconds bounds the shared-pin calls of one request.
-const defaultStoreTimeoutSeconds = 0.05
+const defaultStoreTimeoutSeconds = 0.1
 
 // sharedPinID keys a session in the shared store so that session identifiers
 // do not leave the process.

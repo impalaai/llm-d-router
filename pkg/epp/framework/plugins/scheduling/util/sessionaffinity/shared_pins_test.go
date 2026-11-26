@@ -45,6 +45,8 @@ type fakePinStore struct {
 	err error
 	// stall makes every call wait for its context to end.
 	stall bool
+	// delay makes every call take this long, or until its context ends.
+	delay time.Duration
 	calls int
 	ttls  []time.Duration
 }
@@ -65,11 +67,18 @@ func (f *fakePinStore) begin(ctx context.Context, ttl time.Duration) error {
 	f.mu.Lock()
 	f.calls++
 	f.ttls = append(f.ttls, ttl)
-	stall, err := f.stall, f.err
+	stall, delay, err := f.stall, f.delay, f.err
 	f.mu.Unlock()
 	if stall {
 		<-ctx.Done()
 		return ctx.Err()
+	}
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return err
 }
@@ -397,6 +406,18 @@ func TestSharedPins_StalledStoreReturnsByTheTimeout(t *testing.T) {
 	start := time.Now()
 	require.Equal(t, "pod-a", a.serve("s1", "pod-c"))
 	require.Less(t, time.Since(start), time.Second)
+}
+
+// A store call on a new connection takes longer than 50 ms against
+// ElastiCache. The default timeout leaves it room.
+func TestSharedPins_DefaultTimeoutWaitsForASlowStore(t *testing.T) {
+	store := newFakePinStore()
+	store.delay = 70 * time.Millisecond
+	a := newPinReplica(t, store, nil)
+
+	a.serve("s1", "pod-a")
+
+	require.Equal(t, []string{podKey("pod-a")}, store.pins())
 }
 
 func TestSharedPins_ReadRefreshesTheEvictionTTL(t *testing.T) {
