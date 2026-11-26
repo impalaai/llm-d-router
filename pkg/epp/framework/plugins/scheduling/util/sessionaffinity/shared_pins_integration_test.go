@@ -49,6 +49,9 @@ const (
 	// integrationParallelSessions is how many sessions are in flight at once,
 	// each on every replica.
 	integrationParallelSessions = 16
+	// integrationStartup stands for the time between the creation of an EPP's
+	// plugins and its first request. The syncer connects during it.
+	integrationStartup = time.Second
 )
 
 // TestIntegrationSharedPins runs several session_id strategy instances, each
@@ -84,16 +87,7 @@ func TestIntegrationSharedPins(t *testing.T) {
 	for i := range sessions {
 		sessions[i] = fmt.Sprintf("%s-%d", run, i)
 	}
-	warmup := make([]string, 4*integrationParallelSessions)
-	for i := range warmup {
-		warmup[i] = fmt.Sprintf("%s-warmup-%d", run, i)
-	}
-
-	// The first calls of a client open its connections, which takes longer
-	// than the store timeout allows.
-	before := pinResults()
-	serveOnAll(replicas, "warmup", warmup, func(int) []string { return testPods }, func(_, replica int) string { return testPods[replica] })
-	logPinResults(t, "warmup", before, nil)
+	time.Sleep(integrationStartup)
 
 	pinned := make([]string, len(sessions))
 
@@ -115,18 +109,16 @@ func TestIntegrationSharedPins(t *testing.T) {
 	t.Run("a restarted replica routes to the stored pins", func(t *testing.T) {
 		before := pinResults()
 		restarted := []*pinReplica{newReplica()}
-		routed, _ := serveOnAll(restarted, "restart", sessions,
+		time.Sleep(integrationStartup)
+		routed, durations := serveOnAll(restarted, "restart", sessions,
 			func(int) []string { return testPods },
 			func(session, _ int) string { return otherPods(pinned[session])[0] })
-		delta := logPinResults(t, "restarted replica", before, nil)
+		delta := logPinResults(t, "restarted replica", before, durations)
 
+		require.Zero(t, delta[pinResultError], "store calls that failed or timed out")
 		for i := range sessions {
-			if routed[i][0] != pinned[i] {
-				// A read that timed out on a new connection routes on the scheduler's pick.
-				require.NotZero(t, delta[pinResultError], "session %d went to %s, pinned to %s", i, routed[i][0], pinned[i])
-			}
+			require.Equal(t, pinned[i], routed[i][0], "session %d left its stored pod", i)
 		}
-		require.LessOrEqual(t, delta[pinResultError], float64(integrationParallelSessions), "only the first calls of a new client may time out")
 	})
 
 	t.Run("a session whose pod left moves to one pod on every replica", func(t *testing.T) {
